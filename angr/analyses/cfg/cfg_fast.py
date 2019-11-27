@@ -18,11 +18,11 @@ from ...knowledge_plugins.cfg import CFGNode, MemoryDataSort, MemoryData
 from ...knowledge_plugins.xrefs import XRef, XRefType
 from ...misc.ux import deprecated
 from ... import sim_options as o
-from ...errors import (AngrCFGError, SimEngineError, SimMemoryError, SimTranslationError, SimValueError,
-                       SimOperationError, SimError, AngrUnsupportedSyscallError
+from ...errors import (AngrCFGError, AngrSkipJobNotice, AngrUnsupportedSyscallError, SimEngineError, SimMemoryError,
+                       SimTranslationError, SimValueError, SimOperationError, SimError
                        )
 from ...utils.constants import DEFAULT_STATEMENT
-from ..forward_analysis import ForwardAnalysis, AngrSkipJobNotice
+from ..forward_analysis import ForwardAnalysis
 from .cfg_arch_options import CFGArchOptions
 from .cfg_base import CFGBase
 from .segment_list import SegmentList
@@ -1113,16 +1113,26 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                 self._insert_job(job)
                 return
 
-            job = self._pop_pending_job(returning=False)
-            if job is not None:
-                self._insert_job(job)
-                return
-
         # Try to see if there is any indirect jump left to be resolved
+        # it's possible that certain indirect jumps must be resolved before the returning status of a function can be
+        # determined. e.g., in AArch64
+        # __stubs:00000001000064B0 ___stack_chk_fail
+        # __stubs:00000001000064B0                 NOP
+        # __stubs:00000001000064B4                 LDR             X16, =__imp____stack_chk_fail
+        # __stubs:00000001000064B8                 BR              X16
+        #
+        # we need to rely on indirect jump resolving to identify this call to stack_chk_fail before knowing that
+        # function 0x100006480 does not return. Hence, we resolve indirect jumps before popping undecided pending jobs.
         if self._resolve_indirect_jumps and self._indirect_jumps_to_resolve:
             self._process_unresolved_indirect_jumps()
 
             if self._job_info_queue:
+                return
+
+        if self._pending_jobs:
+            job = self._pop_pending_job(returning=False)
+            if job is not None:
+                self._insert_job(job)
                 return
 
         if self._use_function_prologues and self._remaining_function_prologue_addrs:
@@ -1146,8 +1156,14 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
 
             if addr is not None:
                 # if this is ARM and addr % 4 != 0, it has to be THUMB
-                if is_arm_arch(self.project.arch) and addr % 2 == 0 and addr % 4 != 0:
-                    addr |= 1
+                if is_arm_arch(self.project.arch):
+                    if addr % 2 == 0 and addr % 4 != 0:
+                        addr |= 1
+                    else:
+                        # load 8 bytes and test with THUMB-mode prologues
+                        bytes_prefix = self._fast_memory_load_bytes(addr, 8)
+                        if any(re.match(prolog, bytes_prefix) for prolog in self.project.arch.thumb_prologs):
+                            addr |= 1
                 job = CFGJob(addr, addr, "Ijk_Boring", last_addr=None, job_type=CFGJob.JOB_TYPE_COMPLETE_SCANNING)
                 self._insert_job(job)
                 self._register_analysis_job(addr, job)
@@ -2857,7 +2873,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                 self._pending_jobs.add_nonreturning_function(nonreturning_function.addr)
                 if nonreturning_function.addr in self._function_returns:
                     for fr in self._function_returns[nonreturning_function.addr]:
-                        # Remove all those FakeRet edges
+                        # Remove all pending FakeRet edges
                         if self.kb.functions.contains_addr(fr.caller_func_addr) and \
                                 self.kb.functions.get_by_addr(fr.caller_func_addr).returning is not True:
                             self._updated_nonreturning_functions.add(fr.caller_func_addr)

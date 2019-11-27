@@ -65,8 +65,6 @@ class SimEngineLightVEXMixin:
         if state is not None:
             self.arch = state.arch
 
-        self._visited_blocks = kwargs.pop('visited_blocks', None)
-
         self.tyenv = block.vex.tyenv
 
         self._process_Stmt(whitelist=whitelist)
@@ -95,7 +93,11 @@ class SimEngineLightVEXMixin:
         if self.block.vex.jumpkind == 'Ijk_Call':
             handler = '_handle_function'
             if hasattr(self, handler):
-                getattr(self, handler)(self._expr(self.block.vex.next))
+                func_addr = self._expr(self.block.vex.next)
+                if func_addr is not None:
+                    getattr(self, handler)(func_addr)
+                else:
+                    self.l.debug('Cannot determine the callee address at %#x.', self.block.addr)
             else:
                 self.l.warning('Function handler not implemented.')
 
@@ -529,8 +531,6 @@ class SimEngineLightAILMixin:
         self.block = block
         self.state = state
         self.arch = state.arch
-
-        self._visited_blocks = kwargs.pop('visited_blocks', None)
 
         self._process_Stmt(whitelist=whitelist)
 
