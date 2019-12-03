@@ -1576,6 +1576,9 @@ class CFGBase(Analysis):
                 cfgnode_0 = self.model.get_any_node(addr_0)
                 cfgnode_1 = self.model.get_any_node(addr_1)
 
+                if cfgnode_0 is None or cfgnode_1 is None:
+                    continue
+
                 # Are func_0 adjacent to func_1?
                 if cfgnode_0.addr + cfgnode_0.size != addr_1:
                     continue
@@ -2155,6 +2158,10 @@ class CFGBase(Analysis):
         # Create an IndirectJump instance
         if addr not in self.indirect_jumps:
             if self.project.arch.branch_delay_slot:
+                if len(cfg_node.instruction_addrs) < 2:
+                    # sanity check
+                    # decoding failed when decoding the second instruction (or even the first instruction)
+                    return False, [ ], None
                 ins_addr = cfg_node.instruction_addrs[-2]
             else:
                 ins_addr = cfg_node.instruction_addrs[-1]
