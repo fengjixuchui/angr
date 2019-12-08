@@ -53,6 +53,7 @@ class Project:
     :param exclude_sim_procedures_list: A list of functions to *not* wrap with simprocedures.
     :param arch:                        The target architecture (auto-detected otherwise).
     :param simos:                       a SimOS class to use for this project.
+    :param engine:                      The SimEngine class to use for this project.
     :param bool translation_cache:      If True, cache translated basic blocks rather than re-translating them.
     :param support_selfmodifying_code:  Whether we aggressively support self-modifying code. When enabled, emulation
                                         will try to read code from the current state instead of the original memory,
@@ -62,8 +63,6 @@ class Project:
     :param load_function:               A function that defines how the Project should be loaded. Default to unpickling.
     :param analyses_preset:             The plugin preset for the analyses provider (i.e. Analyses instance).
     :type analyses_preset:              angr.misc.PluginPreset
-    :param engines_preset:              The plugin preset for the engines provider (i.e. EngineHub instance).
-    :type engines_preset:               angr.misc.PluginPreset
 
     Any additional keyword arguments passed will be passed onto ``cle.Loader``.
 
@@ -86,6 +85,7 @@ class Project:
                  exclude_sim_procedures_func=None,
                  exclude_sim_procedures_list=(),
                  arch=None, simos=None,
+                 engine=None,
                  load_options=None,
                  translation_cache=True,
                  support_selfmodifying_code=False,
@@ -93,7 +93,6 @@ class Project:
                  load_function=None,
                  analyses_preset=None,
                  concrete_target=None,
-                 engines_preset=None,
                  **kwargs):
 
         # Step 1: Load the binary
@@ -175,25 +174,9 @@ class Project:
         self.store_function = store_function or self._store
         self.load_function = load_function or self._load
 
-        # Step 4: Set up the project's plugin hubs
-        # Step 4.1: Engines. Get the preset from the loader, from the arch, or use the default.
-        engines = EngineHub(self)
-        if engines_preset is not None:
-            engines.use_plugin_preset(engines_preset)
-        elif self.loader.main_object.engine_preset is not None:
-            try:
-                engines.use_plugin_preset(self.loader.main_object.engine_preset)
-            except AngrNoPluginError:
-                raise ValueError("The CLE loader asked to use a engine preset: %s" % \
-                        self.loader.main_object.engine_preset)
-        else:
-            try:
-                engines.use_plugin_preset(self.arch.name)
-            except AngrNoPluginError:
-                engines.use_plugin_preset('default')
-
-        self.engines = engines
-        self.factory = AngrObjectFactory(self)
+        # Step 4: Set up the project's hubs
+        # Step 4.1 Factory
+        self.factory = AngrObjectFactory(self, default_engine=engine)
 
         # Step 4.2: Analyses
         self.analyses = AnalysesHub(self)
@@ -707,10 +690,8 @@ class Project:
         return self.simos
 
 
-from .errors import AngrNoPluginError
 from .factory import AngrObjectFactory
 from angr.simos import SimOS, os_mapping
 from .analyses.analysis import AnalysesHub
 from .knowledge_base import KnowledgeBase
-from .engines import EngineHub
 from .procedures import SIM_PROCEDURES, SIM_LIBRARIES
