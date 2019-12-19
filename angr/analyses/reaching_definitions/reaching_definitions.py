@@ -1,22 +1,22 @@
 import logging
-import networkx
 from collections import defaultdict
 
 import ailment
 import pyvex
 
 from ...block import Block
-from ...knowledge_plugins.functions.function_manager import Function
 from ...codenode import CodeNode
 from ...misc.ux import deprecated
 from ..analysis import Analysis
-from ..forward_analysis import ForwardAnalysis, FunctionGraphVisitor, SingleNodeGraphVisitor
+from ..forward_analysis import ForwardAnalysis
 from ..code_location import CodeLocation
 from .atoms import Register
 from .constants import OP_BEFORE, OP_AFTER
-from .live_definitions import LiveDefinitions
+from .def_use_graph import DefUseGraph
 from .engine_ail import SimEngineRDAIL
 from .engine_vex import SimEngineRDVEX
+from .live_definitions import LiveDefinitions
+from .subject import Subject, SubjectType
 
 
 l = logging.getLogger(name=__name__)
@@ -38,7 +38,8 @@ class ReachingDefinitionsAnalysis(ForwardAnalysis, Analysis):  # pylint:disable=
 
     def __init__(self, subject=None, func_graph=None, max_iterations=3, track_tmps=False,
                  observation_points=None, init_state=None, init_func=False, cc=None, function_handler=None,
-                 current_local_call_depth=1, maximum_local_call_depth=5, observe_all=False, visited_blocks=None):
+                 current_local_call_depth=1, maximum_local_call_depth=5, observe_all=False, visited_blocks=None,
+                 def_use_graph=None):
         """
         :param Block|Function subject: The subject of the analysis: a function, or a single basic block.
         :param func_graph:                      Alternative graph for function.graph.
@@ -60,22 +61,12 @@ class ReachingDefinitionsAnalysis(ForwardAnalysis, Analysis):  # pylint:disable=
         :param Boolean observe_all:             Observe every statement, both before and after.
         :param List<ailment.Block|Block|CodeNode|CFGNode> visited_blocks:
                                                 A list of previously visited blocks.
+        :param angr.analyses.reaching_definitions.def_use_graph.DefUseGraph def_use_graph:
+                                                An initial definition-use graph to add the result of the analysis to.
         """
 
-        def _init_subject(subject):
-            """
-            :param ailment.Block|angr.Block|Function subject:
-            :return Tuple[ailment.Block|angr.Block, SimCC, Function, GraphVisitor, Boolean]:
-                 Return the values for `_block`, `_cc`, `_function`, `_graph_visitor`, `_init_func`.
-            """
-            if isinstance(subject, Function):
-                return (None, cc, subject, FunctionGraphVisitor(subject, func_graph), init_func)
-            elif isinstance(subject, (ailment.Block, Block)):
-                return (subject, None, None, SingleNodeGraphVisitor(subject), False)
-            else:
-                raise ValueError('Unsupported analysis target.')
-
-        self._block, self._cc, self._function, self._graph_visitor, self._init_func = _init_subject(subject)
+        self._subject = Subject(subject, self.kb.cfgs['CFGFast'], func_graph, cc, init_func)
+        self._graph_visitor = self._subject.visitor
 
         ForwardAnalysis.__init__(self, order_jobs=True, allow_merging=True, allow_widening=False,
                                  graph_visitor=self._graph_visitor)
@@ -88,7 +79,7 @@ class ReachingDefinitionsAnalysis(ForwardAnalysis, Analysis):  # pylint:disable=
         self._current_local_call_depth = current_local_call_depth
         self._maximum_local_call_depth = maximum_local_call_depth
 
-        self.def_use_graph = networkx.DiGraph()
+        self._def_use_graph = def_use_graph or DefUseGraph()
         self.current_codeloc = None
         self.codeloc_uses = set()
 
@@ -129,6 +120,10 @@ class ReachingDefinitionsAnalysis(ForwardAnalysis, Analysis):  # pylint:disable=
             raise ValueError("More than one results are available.")
 
         return next(iter(self.observed_results.values()))
+
+    @property
+    def def_use_graph(self):
+        return self._def_use_graph
 
     @property
     def visited_blocks(self):
@@ -207,9 +202,15 @@ class ReachingDefinitionsAnalysis(ForwardAnalysis, Analysis):  # pylint:disable=
         if self._init_state is not None:
             return self._init_state
         else:
-            func_addr = self._function.addr if self._function else None
+            def _function_data(subject):
+                if subject.type == SubjectType.Function:
+                    return subject.content.addr, subject.cc, subject.init_func
+                else:
+                    return None, None, None
+            func_addr, cc, init_func = _function_data(self._subject)
+
             return LiveDefinitions(self.project.arch, track_tmps=self._track_tmps, analysis=self,
-                                   init_func=self._init_func, cc=self._cc, func_addr=func_addr)
+                                   init_func=init_func, cc=cc, func_addr=func_addr)
 
     def _merge_states(self, node, *states):
         return states[0].merge(*states[1:])
