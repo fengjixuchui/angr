@@ -1363,8 +1363,8 @@ class CFGBase(Analysis):
 
     def _process_irrational_functions(self, functions, predetermined_function_addrs, blockaddr_to_function):
         """
-        For unresolveable indirect jumps, angr marks those jump targets as individual functions. For example, usually
-        the following pattern is seen:
+        When force_complete_scan is enabled, for unresolveable indirect jumps, angr will find jump targets and mark
+        them as individual functions. For example, usually the following pattern is seen:
 
         sub_0x400010:
             push ebp
@@ -1395,9 +1395,9 @@ class CFGBase(Analysis):
 
         functions_to_remove = { }
 
-        functions_can_be_removed = set(functions.keys()) - set(predetermined_function_addrs)
+        all_func_addrs = sorted(set(functions.keys()))
 
-        for func_addr, function in functions.items():
+        for func_pos, (func_addr, function) in enumerate(functions.items()):
 
             if func_addr in functions_to_remove:
                 continue
@@ -1483,7 +1483,10 @@ class CFGBase(Analysis):
 
             should_merge = True
             functions_to_merge = set()
-            for f_addr in functions_can_be_removed:
+            i = func_pos + 1
+            while i < len(all_func_addrs):
+                f_addr = all_func_addrs[i]
+                i += 1
                 f = functions[f_addr]
                 if f_addr == func_addr:
                     continue
@@ -1663,9 +1666,10 @@ class CFGBase(Analysis):
         :return:    True if it is a tail-call optimization. False otherwise.
         :rtype:     bool
         """
-
         def _has_more_than_one_exit(node_):
-            return len(g.out_edges(node_)) > 1
+            # Do not consider FakeRets as counting as multiple exits here.
+            out_edges = list(filter(lambda x: g.get_edge_data(*x)['jumpkind'] != 'Ijk_FakeRet', g.out_edges(node_)))
+            return len(out_edges) > 1
 
         if len(all_edges) == 1 and dst_addr != src_addr:
             the_edge = next(iter(all_edges))
