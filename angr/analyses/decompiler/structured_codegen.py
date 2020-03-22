@@ -9,9 +9,10 @@ from ailment import Block, Expr, Stmt
 from ...sim_type import SimTypeLongLong, SimTypeInt, SimTypeShort, SimTypeChar, SimTypePointer
 from ...sim_variable import SimVariable, SimTemporaryVariable, SimStackVariable, SimRegisterVariable
 from ...utils.constants import is_alignment_mask
+from ...errors import UnsupportedNodeTypeError
 from .. import Analysis, register_analysis
 from .region_identifier import MultiNode
-from .structurer import SequenceNode, CodeNode, ConditionNode, ConditionalBreakNode, LoopNode, BreakNode
+from .structurer import SequenceNode, CodeNode, ConditionNode, ConditionalBreakNode, LoopNode, BreakNode, SwitchCaseNode
 
 
 l = logging.getLogger(name=__name__)
@@ -97,10 +98,6 @@ class PositionMapping:
         return None
 
 
-class UnsupportedNodeTypeError(NotImplementedError):
-    pass
-
-
 class CConstruct:
     """
     Represents a program construct in C.
@@ -165,6 +162,8 @@ class CStatements(CStatement):
                 posmap.pos = old_pos + len(stmt_str) + 1  # account for the newline
             stmt_strings.append(stmt_str)
 
+        if posmap and stmt_strings:
+            posmap.pos -= 1  # no newline at the end
         return "\n".join(stmt_strings)
 
 
@@ -318,7 +317,12 @@ class CIfElse(CStatement):
         if posmap: posmap.tick_pos(len(line_1) + 1)
         lines = [ line_0, line_1 ]
 
+        if posmap:
+            old_pos = posmap.pos
         lines.append(self.true_node.c_repr(indent=indent + INDENT_DELTA, posmap=posmap))
+        if posmap:
+            posmap.pos = old_pos
+            posmap.tick_pos(len(lines[-1]) + 1)  # newline
 
         line_2 = indent_str + "}"
         if posmap: posmap.tick_pos(len(line_2) + 1)
@@ -329,10 +333,11 @@ class CIfElse(CStatement):
             line_4 = indent_str + '{'
             lines.append(line_3)
             lines.append(line_4)
-            posmap.tick_pos(len(line_3) + 1 + len(line_4) + 1)
+            if posmap: posmap.tick_pos(len(line_3) + 1 + len(line_4) + 1)
             lines.append(self.false_node.c_repr(indent=indent + INDENT_DELTA, posmap=posmap))
-            posmap.tick_pos(1)
+            if posmap: posmap.tick_pos(1)
             lines.append(indent_str + "}")
+            if posmap: posmap.tick_pos(len(lines[-1]))
 
         return "\n".join(lines)
 
@@ -368,8 +373,68 @@ class CBreak(CStatement):
     def c_repr(self, indent=0, posmap=None):
 
         indent_str = self.indent_str(indent=indent)
+        s = indent_str + "break;"
+        if posmap: posmap.tick_pos(len(s))
 
-        return indent_str + "break;"
+        return s
+
+
+class CSwitchCase(CStatement):
+    """
+    Represents a switch-case statement in C.
+    """
+    def __init__(self, switch, cases, default):
+        super().__init__()
+
+        self.switch = switch
+        self.cases = cases
+        self.default = default
+
+    def c_repr(self, indent=0, posmap=None):
+
+        indent_str = self.indent_str(indent=indent)
+
+        r = ""
+        # switch
+        a = indent_str + "switch ("
+        if posmap: posmap.tick_pos(len(a))
+        b = self.switch.c_repr(posmap=posmap)
+        c = ")\n"
+        if posmap: posmap.tick_pos(len(c))
+        r = a + b + c
+
+        # cases
+        opening = indent_str + "{\n"
+        if posmap: posmap.tick_pos(len(opening))
+        r += opening
+        for idx, case in self.cases:
+            case_str_a = indent_str + "case "
+            if posmap: posmap.tick_pos(len(case_str_a))
+            case_str_b = str(idx)
+            if posmap: posmap.tick_pos(len(case_str_b))
+            case_str_c = ":\n"
+            if posmap: posmap.tick_pos(len(case_str_c))
+
+            # case body
+            case_str_d = case.c_repr(indent=indent + INDENT_DELTA, posmap=posmap)
+            case_str_e = "\n"
+            if posmap: posmap.tick_pos(len(case_str_e))
+
+            r += case_str_a + case_str_b + case_str_c + case_str_d + case_str_e
+
+        if self.default is not None:
+            default_str_a = indent_str + "default:\n"
+            if posmap: posmap.tick_pos(len(default_str_a))
+            default_str_b = self.default.c_repr(indent=indent + INDENT_DELTA, posmap=posmap)
+            default_str_c = "\n"
+            if posmap: posmap.tick_pos(len(default_str_c))
+            r += default_str_a + default_str_b + default_str_c
+
+        ending = indent_str + "}"
+        r += ending
+        if posmap: posmap.tick_pos(len(ending))
+
+        return r
 
 
 class CAssignment(CStatement):
@@ -451,13 +516,13 @@ class CFunctionCall(CStatement):
             posmap.tick_pos(len(s_func))
 
         args_list = [ ]
-        for arg in self.args:
+        for i, arg in enumerate(self.args):
             if isinstance(arg, CExpression):
                 arg_str = arg.c_repr(posmap=posmap)
-                if posmap: posmap.tick_pos(len(", "))
+                if i != len(self.args) - 1 and posmap: posmap.tick_pos(len(", "))
             else:
                 arg_str = str(arg)
-                if posmap: posmap.tick_pos(len(arg_str) + len(", "))
+                if i != len(self.args) - 1 and posmap: posmap.tick_pos(len(arg_str) + len(", "))
             args_list.append(arg_str)
         args_str = ", ".join(args_list)
 
@@ -681,6 +746,7 @@ class CBinaryOp(CExpression):
         OP_MAP = {
             'Add': self._c_repr_add,
             'Sub': self._c_repr_sub,
+            'Mul': self._c_repr_mul,
             'And': self._c_repr_and,
             'Xor': self._c_repr_xor,
             'Shr': self._c_repr_shr,
@@ -690,6 +756,7 @@ class CBinaryOp(CExpression):
             'CmpULE': self._c_repr_cmple,  # FIXME: use the unsigned version
             'CmpLT': self._c_repr_cmplt,
             'CmpGT': self._c_repr_cmpgt,
+            'CmpGE': self._c_repr_cmpge,
             'CmpUGT': self._c_repr_cmpgt,  # FIXME: use the unsigned version
             'CmpEQ': self._c_repr_cmpeq,
             'CmpNE': self._c_repr_cmpne,
@@ -714,6 +781,13 @@ class CBinaryOp(CExpression):
     def _c_repr_sub(self, posmap=None):
         lhs = self._try_c_repr(self.lhs, posmap=posmap)
         op = " - "
+        if posmap: posmap.tick_pos(len(op))
+        rhs = self._try_c_repr(self.rhs, posmap=posmap)
+        return lhs + op + rhs
+
+    def _c_repr_mul(self, posmap=None):
+        lhs = self._try_c_repr(self.lhs, posmap=posmap)
+        op = " * "
         if posmap: posmap.tick_pos(len(op))
         rhs = self._try_c_repr(self.rhs, posmap=posmap)
         return lhs + op + rhs
@@ -771,6 +845,13 @@ class CBinaryOp(CExpression):
     def _c_repr_cmpgt(self, posmap=None):
         lhs = self._try_c_repr(self.lhs, posmap=posmap)
         op = " > "
+        if posmap: posmap.tick_pos(len(op))
+        rhs = self._try_c_repr(self.rhs, posmap=posmap)
+        return lhs + op + rhs
+
+    def _c_repr_cmpge(self, posmap=None):
+        lhs = self._try_c_repr(self.lhs, posmap=posmap)
+        op = " >= "
         if posmap: posmap.tick_pos(len(op))
         rhs = self._try_c_repr(self.rhs, posmap=posmap)
         return lhs + op + rhs
@@ -851,24 +932,17 @@ class CRegister(CExpression):
 
 class StructuredCodeGenerator(Analysis):
     def __init__(self, func, sequence, indent=0, cfg=None):
-        self._func = func
-        self._sequence = sequence
-        self._cfg = cfg
-
-        self.text = None
-        self.posmap = None
-        self.nodemap = None
-        self._indent = indent
 
         self._handlers = {
-            SequenceNode: self._handle_Sequence,
             CodeNode: self._handle_Code,
+            SequenceNode: self._handle_Sequence,
             LoopNode: self._handle_Loop,
             ConditionNode: self._handle_Condition,
             ConditionalBreakNode: self._handle_ConditionalBreak,
             MultiNode: self._handle_MultiNode,
             Block: self._handle_AILBlock,
             BreakNode: self._handle_Break,
+            SwitchCaseNode: self._handle_SwitchCase,
             # AIL statements
             Stmt.Store: self._handle_Stmt_Store,
             Stmt.Assignment: self._handle_Stmt_Assignment,
@@ -889,11 +963,21 @@ class StructuredCodeGenerator(Analysis):
             SimRegisterVariable: self._handle_Variable_SimRegisterVariable,
         }
 
+        self._func = func
+        self._cfg = cfg
+        self._sequence = sequence
+
+        self.text = None
+        self.posmap = None
+        self.nodemap = None
+        self._indent = indent
+
         self._analyze()
 
     def _analyze(self):
 
         obj = self._handle(self._sequence)
+
         func = CFunction(self._func.name, obj)
 
         self.posmap = PositionMapping()
@@ -965,15 +1049,14 @@ class StructuredCodeGenerator(Analysis):
     #
 
     def _handle(self, node):
-
         handler = self._handlers.get(node.__class__, None)
         if handler is not None:
             return handler(node)
         raise UnsupportedNodeTypeError("Node type %s is not supported yet." % type(node))
 
-    def _handle_Code(self, code):
+    def _handle_Code(self, node):
 
-        return self._handle(code.node)
+        return self._handle(node.node)
 
     def _handle_Sequence(self, seq):
 
@@ -1023,6 +1106,19 @@ class StructuredCodeGenerator(Analysis):
             lines.append(r)
 
         return CStatements(lines) if len(lines) > 1 else lines[0]
+
+    def _handle_SwitchCase(self, node):
+        """
+
+        :param SwitchCaseNode node:
+        :return:
+        """
+
+        switch_expr = self._handle(node.switch_expr)
+        cases = [ (idx, self._handle(case)) for idx, case in node.cases.items() ]
+        default = self._handle(node.default_node) if node.default_node is not None else None
+        switch_case = CSwitchCase(switch_expr, cases, default=default)
+        return switch_case
 
     def _handle_AILBlock(self, node):
         """
