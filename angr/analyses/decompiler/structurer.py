@@ -7,202 +7,21 @@ import networkx
 import claripy
 import ailment
 
+from ...utils.graph import dominates
 from ...block import Block, BlockNode
 from .. import Analysis, register_analysis
 from ..cfg.cfg_utils import CFGUtils
 from .region_identifier import MultiNode, GraphRegion
+from .structurer_nodes import BaseNode, SequenceNode, CodeNode, ConditionNode, ConditionalBreakNode, LoopNode, \
+    SwitchCaseNode, BreakNode
+from .empty_node_remover import EmptyNodeRemover
 
 l = logging.getLogger(name=__name__)
-
-INDENT_DELTA = 2
 
 
 class EmptyBlockNotice(Exception):
     pass
 
-
-class SequenceNode:
-    def __init__(self, nodes=None):
-        self.nodes = nodes if nodes is not None else [ ]
-
-    def __repr__(self):
-        return "<SequenceNode %#x, %d nodes>" % (self.addr, len(self.nodes))
-
-    @property
-    def addr(self):
-        if self.nodes:
-            return self.nodes[0].addr
-        else:
-            return None
-
-    def add_node(self, node):
-        self.nodes.append(node)
-
-    def insert_node(self, pos, node):
-        self.nodes.insert(pos, node)
-
-    def remove_node(self, node):
-        self.nodes.remove(node)
-
-    def node_position(self, node):
-        return self.nodes.index(node)
-
-    def remove_empty_node(self):
-
-        new_nodes = [ ]
-
-        for node in self.nodes:
-            if type(node) is ConditionNode and self._test_empty_condition_node(node):
-                continue
-            if type(node) is CodeNode and self.test_empty_node(node.node):
-                continue
-            if self.test_empty_node(node):
-                continue
-            new_nodes.append(node)
-
-        self.nodes = new_nodes
-
-    def _test_empty_condition_node(self, cond_node):
-
-        for node in [ cond_node.true_node, cond_node.false_node ]:
-            if node is None:
-                continue
-            if type(node) is CodeNode and self.test_empty_node(node.node):
-                continue
-            if self.test_empty_node(node):
-                continue
-            return False
-
-        return True
-
-    @staticmethod
-    def test_empty_node(node):
-        # pylint:disable=simplifiable-if-statement
-        if type(node) is ailment.Block:
-            if not node.statements:
-                return True
-            if len(node.statements) == 1 and type(node.statements[0]) is ailment.Stmt.ConditionalJump:
-                # conditional jumps have been taken care of during reaching condition recovery
-                return True
-            else:
-                # not empty
-                return False
-        elif type(node) is CodeNode:
-            return SequenceNode.test_empty_node(node.node)
-        # unsupported node type. probably not empty?
-        return False
-
-    def copy(self):
-        return SequenceNode(nodes=self.nodes[::])
-
-    def dbg_repr(self, indent=0):
-        s = ""
-        for node in self.nodes:
-            s += (node.dbg_repr(indent=indent + INDENT_DELTA))
-            s += "\n"
-
-        return s
-
-
-class CodeNode:
-    def __init__(self, node, reaching_condition):
-        self.node = node
-        self.reaching_condition = reaching_condition
-
-    def __repr__(self):
-        if self.addr is not None:
-            return "<CodeNode %#x>" % self.addr
-        else:
-            return "<CodeNode %s>" % repr(self.node)
-
-    @property
-    def addr(self):
-        if hasattr(self.node, 'addr'):
-            return self.node.addr
-        else:
-            return None
-
-    def dbg_repr(self, indent=0):
-        indent_str = indent * " "
-        s = ""
-        if self.reaching_condition is not None and not claripy.is_true(self.reaching_condition):
-            s += (indent_str + "if (<block-missing>; %s)\n" +
-                 indent_str + "{\n" +
-                 indent_str + "  %s\n" +
-                 indent_str + "}") % \
-                              (self.reaching_condition, self.node)
-        else:
-            s += indent_str + str(self.node)
-
-        return s
-
-    def copy(self):
-        return CodeNode(self.node, self.reaching_condition)
-
-
-class ConditionNode:
-    def __init__(self, addr, reaching_condition, condition, true_node, false_node=None):
-        self.addr = addr
-        self.reaching_condition = reaching_condition
-        self.condition = condition
-        self.true_node = true_node
-        self.false_node = false_node
-
-    def dbg_repr(self, indent=0):
-        indent_str = indent * " "
-        s = ""
-        s += (indent_str + "if (<block-missing>; %s)\n" +
-              indent_str + "{\n" +
-              indent_str + "%s\n" +
-              indent_str + "}\n") % (
-            self.condition, self.true_node.dbg_repr(indent+2),
-        )
-        if self.false_node is not None:
-            s += (indent_str + "else\n" +
-              indent_str + "{\n" +
-              indent_str + "%s\n" +
-              indent_str + "}") % \
-             self.false_node.dbg_repr(indent+2)
-
-        return s
-
-
-class LoopNode:
-    def __init__(self, sort, condition, sequence_node, addr=None):
-        self.sort = sort
-        self.condition = condition
-        self.sequence_node = sequence_node
-        self._addr = addr
-
-    @property
-    def addr(self):
-        if self._addr is None:
-            return self.sequence_node.addr
-        else:
-            return self._addr
-
-
-class BreakNode:
-    def __init__(self, addr, target):
-        self.addr = addr
-        self.target = target
-
-
-class ConditionalBreakNode(BreakNode):
-    def __init__(self, addr, condition, target):
-        super(ConditionalBreakNode, self).__init__(addr, target)
-        self.condition = condition
-
-    def __repr__(self):
-        return "<ConditionalBreakNode %#x target:%#x>" % (self.addr, self.target)
-
-
-class SwitchCaseNode:
-    def __init__(self, switch_expr, cases, default_node, addr=None):
-        self.switch_expr = switch_expr
-        self.cases = cases
-        self.default_node = default_node
-        self.addr = addr
 
 #
 # The main analysis
@@ -326,9 +145,17 @@ class Structurer(Analysis):
             seq_ = self._new_sequences.pop(0)
             self._structure_sequence(seq_)
 
+        # remove conditional jumps
+        seq = self._remove_conditional_jumps(seq)
+        seq = EmptyNodeRemover(seq).result
+
         self._make_condition_nodes(seq)
 
         seq = self._merge_conditional_breaks(seq)
+
+        seq = self._merge_nesting_conditionals(seq)
+
+        seq = EmptyNodeRemover(seq).result
 
         seq = self._remove_claripy_bool_asts(seq)
 
@@ -545,7 +372,7 @@ class Structurer(Analysis):
 
     def _to_loop_body_sequence(self, loop_head, loop_subgraph, loop_successors):
 
-        graph = self._region.graph
+        graph = self._region.graph_with_successors
         loop_nodes = set(s.addr for s in graph.nodes)
         loop_region_graph = networkx.DiGraph()
 
@@ -567,65 +394,34 @@ class Structurer(Analysis):
 
             successors = list(graph.successors(node))  # successors are all inside the current region
 
-            last_stmt = self._get_last_statement(node)
-            real_successor_addrs = self._extract_jump_targets(last_stmt)
+            try:
+                last_stmt = self._get_last_statement(node)
+            except EmptyBlockNotice:
+                # this block is empty
+                last_stmt = None
 
-            if any(succ_addr in loop_successor_addrs for succ_addr in real_successor_addrs):
-                # This node has an exit to the outside of the loop
-                # add a break or a conditional break node
-                new_node = None
-                if type(last_stmt) is ailment.Stmt.Jump:
-                    # shrink the block to remove the last statement
-                    self._remove_last_statement(node)
-                    # add a break
-                    new_node = BreakNode(last_stmt.ins_addr, last_stmt.target.value)
-                elif type(last_stmt) is ailment.Stmt.ConditionalJump:
-                    # add a conditional break
-                    if last_stmt.true_target.value in loop_successor_addrs and \
-                                last_stmt.false_target.value in loop_nodes:
-                        cond = last_stmt.condition
-                        target = last_stmt.true_target.value
-                    elif last_stmt.false_target.value in loop_successor_addrs and \
-                                last_stmt.true_target.value in loop_nodes:
-                        cond = ailment.Expr.UnaryOp(last_stmt.condition.idx, 'Not', (last_stmt.condition))
-                        target = last_stmt.false_target.value
-                    else:
-                        l.warning("I'm not sure which branch is jumping out of the loop...")
-                        raise Exception()
-                    # remove the last statement from the node
-                    self._remove_last_statement(node)
-                    new_node = ConditionalBreakNode(
-                        last_stmt.ins_addr,
-                        self._claripy_ast_from_ail_condition(cond),
-                        target
-                    )
+            if last_stmt is not None:
+                real_successor_addrs = self._extract_jump_targets(last_stmt)
 
-                if new_node is not None:
-                    # special checks if node goes empty
-                    if isinstance(node, ailment.Block) and not node.statements:
-                        # new_node will replace node
-                        new_node.addr = node.addr
-                        replaced_nodes[node] = new_node
-                        if loop_head is node:
-                            loop_head = new_node
-
-                        preds = list(loop_region_graph.predecessors(node))
-                        loop_region_graph.remove_node(node)
-                        loop_region_graph.add_node(new_node)
-                        if new_node is not loop_head:
-                            for pred in preds:
-                                loop_region_graph.add_edge(pred, new_node)
-                    else:
-                        loop_region_graph.add_edge(node, new_node)
-                    # update node
-                    node = new_node
+                if any(succ_addr in loop_successor_addrs for succ_addr in real_successor_addrs):
+                    # This node has an exit to the outside of the loop
+                    # add a break or a conditional break node
+                    new_node, new_loop_head = self._loop_create_break_node(node, last_stmt, loop_region_graph,
+                                                                           loop_head, loop_nodes,
+                                                                           loop_successor_addrs, replaced_nodes)
+                    if new_node is not None:
+                        # replace node
+                        node = new_node
+                    if new_loop_head is not None:
+                        # replace the loop head
+                        loop_head = new_loop_head
 
             for dst in successors:
                 # sanity check
-                if dst in loop_successors:
+                if dst.addr in loop_successor_addrs:
                     outedges.append((node, dst))
                     continue
-                if dst not in loop_subgraph and dst not in loop_successors:
+                if dst not in loop_subgraph and dst.addr not in loop_successor_addrs:
                     # what's this node?
                     l.error("Found a node that belongs to neither loop body nor loop successors. Something is wrong.")
                     # raise Exception()
@@ -637,8 +433,10 @@ class Structurer(Analysis):
 
         # Create a graph region and structure it
         loop_region_graph_with_successors = networkx.DiGraph(loop_region_graph)
+        loop_successors = set()  # update loop_successors with nodes in outedges
         for src, dst in outedges:
             loop_region_graph_with_successors.add_edge(src, dst)
+            loop_successors.add(dst)
         region = GraphRegion(loop_head, loop_region_graph, successors=loop_successors,
                              graph_with_successors=loop_region_graph_with_successors)
         structurer = self.project.analyses.Structurer(region, condition_mapping=self._condition_mapping.copy())
@@ -653,32 +451,71 @@ class Structurer(Analysis):
             # we want to remove this Jump as it is not necessary anymore
             self._remove_last_statement(seq)
 
-        seq.remove_empty_node()
+        seq = EmptyNodeRemover(seq).result
 
         return seq
 
+    def _loop_create_break_node(self, node, last_stmt, loop_region_graph, loop_head, loop_nodes, loop_successor_addrs,
+                                replaced_nodes):
+
+        # This node has an exit to the outside of the loop
+        # add a break or a conditional break node
+        new_node = None
+        new_loop_head = None
+
+        if type(last_stmt) is ailment.Stmt.Jump:
+            # shrink the block to remove the last statement
+            self._remove_last_statement(node)
+            # add a break
+            new_node = BreakNode(last_stmt.ins_addr, last_stmt.target.value)
+        elif type(last_stmt) is ailment.Stmt.ConditionalJump:
+            # add a conditional break
+            if last_stmt.true_target.value in loop_successor_addrs and \
+                    last_stmt.false_target.value in loop_nodes:
+                cond = last_stmt.condition
+                target = last_stmt.true_target.value
+            elif last_stmt.false_target.value in loop_successor_addrs and \
+                    last_stmt.true_target.value in loop_nodes:
+                cond = ailment.Expr.UnaryOp(last_stmt.condition.idx, 'Not', (last_stmt.condition))
+                target = last_stmt.false_target.value
+            else:
+                l.warning("I'm not sure which branch is jumping out of the loop...")
+                raise Exception()
+            # remove the last statement from the node
+            self._remove_last_statement(node)
+            new_node = ConditionalBreakNode(
+                last_stmt.ins_addr,
+                self._claripy_ast_from_ail_condition(cond),
+                target
+            )
+
+        if new_node is not None:
+            # special checks if node goes empty
+            if isinstance(node, ailment.Block) and not node.statements:
+                # new_node will replace node
+                new_node.addr = node.addr
+                replaced_nodes[node] = new_node
+                if loop_head is node:
+                    new_loop_head = new_node
+
+                preds = list(loop_region_graph.predecessors(node))
+                loop_region_graph.remove_node(node)
+                loop_region_graph.add_node(new_node)
+                if new_node is not loop_head:
+                    for pred in preds:
+                        loop_region_graph.add_edge(pred, new_node)
+            else:
+                loop_region_graph.add_edge(node, new_node)
+
+        return new_node, new_loop_head
+
     def _recover_reaching_conditions(self):
 
-        def _immediately_postdominates(node_a, node_b):
+        def _strictly_postdominates(idoms, node_a, node_b):
             """
-            Does node A immediately post-dominate node B on the graph?
+            Does node A strictly post-dominate node B on the graph?
             """
-            if not self._region.successors:
-                # region does not have any successors.
-                return True
-            if len(self._region.successors) != 1:
-                # TODO: this region has more than one successors. support this case.
-                return False
-
-            succ = next(iter(self._region.successors))
-            if succ not in self._region.graph_with_successors:
-                # the specific successor is not within the graph with successors
-                # in other words, the successor is not reachable. this region does not have successors.
-                return True
-
-            inverted_graph = networkx.reverse(self._region.graph_with_successors)
-            idoms = networkx.immediate_dominators(inverted_graph, succ)
-            return idoms[node_b] is node_a
+            return dominates(idoms, node_a, node_b)
 
         edge_conditions = { }
         predicate_mapping = { }
@@ -697,6 +534,22 @@ class Structurer(Analysis):
                 # no successors
                 end_nodes.add(src)
 
+        if end_nodes:
+            inverted_graph = networkx.reverse(self._region.graph)
+            if len(end_nodes) > 1:
+                # make sure there is only one end node
+                dummy_node = "DUMMY_NODE"
+                for end_node in end_nodes:
+                    inverted_graph.add_edge(dummy_node, end_node)
+                endnode = dummy_node
+            else:
+                endnode = next(iter(end_nodes))  # pick the end node
+
+            idoms = networkx.immediate_dominators(inverted_graph, endnode)
+        else:
+            idoms = None
+
+
         reaching_conditions = { }
         # recover the reaching condition for each node
         sorted_nodes = CFGUtils.quasi_topological_sort_nodes(self._region.graph)
@@ -707,7 +560,7 @@ class Structurer(Analysis):
             if node is self._region.head:
                 # the head is always reachable
                 reaching_condition = claripy.true
-            elif len(end_nodes) == 1 and node in end_nodes and _immediately_postdominates(node, self._region.head):
+            elif idoms is not None and _strictly_postdominates(idoms, node, self._region.head):
                 # the node that post dominates the head is always reachable
                 reaching_conditions[node] = claripy.true
             else:
@@ -743,16 +596,19 @@ class Structurer(Analysis):
         if cond in self._condition_mapping:
             return self._condition_mapping[cond]
 
+        def _binary_op_reduce(op, args):
+            r = None
+            for arg in args:
+                if r is None:
+                    r = self._convert_claripy_bool_ast(arg)
+                else:
+                    r = ailment.Expr.BinaryOp(None, op, (r, self._convert_claripy_bool_ast(arg)))
+            return r
+
         _mapping = {
             'Not': lambda cond_: ailment.Expr.UnaryOp(None, 'Not', self._convert_claripy_bool_ast(cond_.args[0])),
-            'And': lambda cond_: ailment.Expr.BinaryOp(None, 'LogicalAnd', (
-                self._convert_claripy_bool_ast(cond_.args[0]),
-                self._convert_claripy_bool_ast(cond_.args[1]),
-            )),
-            'Or': lambda cond_: ailment.Expr.BinaryOp(None, 'LogicalOr', (
-                self._convert_claripy_bool_ast(cond_.args[0]),
-                self._convert_claripy_bool_ast(cond_.args[1]),
-            )),
+            'And': lambda cond_: _binary_op_reduce('LogicalAnd', cond_.args),
+            'Or': lambda cond_: _binary_op_reduce('LogicalOr', cond_.args),
             'ULE': lambda cond_: ailment.Expr.BinaryOp(None, 'CmpULE',
                                                           tuple(map(self._convert_claripy_bool_ast, cond_.args)),
                                                           ),
@@ -814,9 +670,17 @@ class Structurer(Analysis):
     def _structure_sequence(self, seq):
 
         self._make_switch_cases(seq)
+
+        # remove conditional jumps of the current level
+        seq = self._remove_conditional_jumps(seq, follow_seq=False)
+        new_seq = EmptyNodeRemover(seq).result
+
+        # this is hackish...
+        seq.nodes = new_seq.nodes
+
         self._merge_same_conditioned_nodes(seq)
-        self._make_ites(seq)
         self._structure_common_subexpression_conditions(seq)
+        self._make_ites(seq)
 
     def _merge_same_conditioned_nodes(self, seq):
 
@@ -935,11 +799,11 @@ class Structurer(Analysis):
                     del addr2nodes[node_.addr]
                 # remove the last statement in node
                 self._remove_last_statement(node)
-                if SequenceNode.test_empty_node(node):
+                if BaseNode.test_empty_node(node):
                     seq.remove_node(node)
                 # remove the last statement in node_a
                 self._remove_last_statement(node_a)
-                if SequenceNode.test_empty_node(node_a):
+                if BaseNode.test_empty_node(node_a):
                     seq.remove_node(node_a)
 
                 # we found a node that looks like a switch-case. seq.nodes are changed. resume to find the next such
@@ -1061,7 +925,7 @@ class Structurer(Analysis):
             to_remove.add(entry_node)
 
             # find nodes that this entry node dominates
-            cond_subexprs = list(self._get_reaching_condition_subexprs(entry_node.reaching_condition))
+            cond_subexprs = list(self._get_ast_subexprs(entry_node.reaching_condition))
             guarded_nodes = None
             for subexpr in cond_subexprs:
                 guarded_node_candidates = self._nodes_guarded_by_common_subexpr(seq, subexpr, header_idx + 1)
@@ -1092,7 +956,7 @@ class Structurer(Analysis):
 
     def _switch_handle_gotos(self, cases, default, switch_end_addr):
         """
-        For each case, convert the goto that goes to
+        For each case, convert the goto that goes to outside of the switch-case to a break statement.
 
         :param dict cases:              A dict of switch-cases.
         :param default:                 The default node.
@@ -1207,9 +1071,11 @@ class Structurer(Analysis):
             if rcond_0 is None:
                 i += 1
                 continue
-            subexprs_0 = list(self._get_reaching_condition_subexprs(rcond_0))
+            subexprs_0 = list(self._get_ast_subexprs(rcond_0))
 
             for common_subexpr in subexprs_0:
+                if claripy.is_true(common_subexpr):
+                    continue
                 candidates = self._nodes_guarded_by_common_subexpr(seq, common_subexpr, i + 1)
                 if candidates:
                     candidates.insert(0,
@@ -1238,7 +1104,7 @@ class Structurer(Analysis):
             rcond_1 = node_1.reaching_condition
             if rcond_1 is None:
                 continue
-            subexprs_1 = list(self._get_reaching_condition_subexprs(rcond_1))
+            subexprs_1 = list(self._get_ast_subexprs(rcond_1))
             if any(subexpr_1 is common_subexpr for subexpr_1 in subexprs_1):
                 # we found one!
                 candidates.append((starting_idx + j, node_1, subexprs_1))
@@ -1314,42 +1180,146 @@ class Structurer(Analysis):
                                            new_node_1))
         seq.nodes = [ n for n in seq.nodes if n is not None ]
 
+    #
+    # Other methods
+    #
+
+    @staticmethod
+    def _remove_conditional_jumps_from_block(block, parent=None, index=0, label=None):  # pylint:disable=unused-argument
+        block.statements = [stmt for stmt in block.statements
+                            if not isinstance(stmt, ailment.Stmt.ConditionalJump)]
+
+    @staticmethod
+    def _remove_conditional_jumps(seq, follow_seq=True):
+        """
+        Remove all conditional jumps.
+
+        :param SequenceNode seq:    The SequenceNode instance to handle.
+        :return:                    A processed SequenceNode.
+        """
+
+        def _handle_Sequence(node, **kwargs):
+            if not follow_seq and node is not seq:
+                return None
+            return walker._handle_Sequence(node, **kwargs)
+
+
+        handlers = {
+            SequenceNode: _handle_Sequence,
+            ailment.Block: Structurer._remove_conditional_jumps_from_block,
+        }
+
+        walker = SequenceWalker(handlers=handlers)
+        walker.walk(seq)
+
+        return seq
+
     def _merge_conditional_breaks(self, seq):
 
         # Find consecutive ConditionalBreakNodes and merge their conditions
 
-        new_nodes = [ ]
-        i = 0
-        while i < len(seq.nodes):
-            node = seq.nodes[i]
+        def _handle_SequenceNode(seq_node, parent=None, index=0, label=None):  # pylint:disable=unused-argument
+            new_nodes = []
+            i = 0
+            while i < len(seq_node.nodes):
+                node = seq_node.nodes[i]
+                if type(node) is CodeNode:
+                    node = node.node
+                if isinstance(node, ConditionalBreakNode) and new_nodes:
+                    prev_node = new_nodes[-1]
+                    if type(prev_node) is CodeNode:
+                        prev_node = prev_node.node
+                    if isinstance(prev_node, ConditionalBreakNode):
+                        # found them!
+                        # pop the previously added node
+                        if new_nodes:
+                            new_nodes = new_nodes[:-1]
+                        merged_condition = self._simplify_condition(claripy.Or(node.condition, prev_node.condition))
+                        new_node = ConditionalBreakNode(node.addr,
+                                                        merged_condition,
+                                                        node.target
+                                                        )
+                        node = new_node
+                else:
+                    walker._handle(node, parent=seq_node, index=i)
 
+                new_nodes.append(node)
+                i += 1
+
+            seq_node.nodes = new_nodes
+
+        handlers = {
+            SequenceNode: _handle_SequenceNode,
+        }
+
+        walker = SequenceWalker(handlers=handlers)
+        walker.walk(seq)
+        return seq
+
+    def _merge_nesting_conditionals(self, seq):
+
+        # find if(A) { if(B) { ... ] } and simplify them to if( A && B ) { ... }
+
+        def _condnode_truenode_only(node):
             if type(node) is CodeNode:
+                # unpack
                 node = node.node
+            if isinstance(node, ConditionNode) and \
+                    node.true_node is not None and \
+                    node.false_node is None:
+                return True, node
+            return False, None
 
+        def _condbreaknode(node):
+            if type(node) is CodeNode:
+                # unpack
+                node = node.node
             if isinstance(node, SequenceNode):
-                node = self._merge_conditional_breaks(node)
-            elif isinstance(node, ConditionalBreakNode) and i > 0:
-                prev_node = seq.nodes[i-1]
-                if type(prev_node) is CodeNode:
-                    prev_node = prev_node.node
-                if isinstance(prev_node, ConditionalBreakNode):
-                    # found them!
+                if len(node.nodes) != 1:
+                    return False, None
+                node = node.nodes[0]
+                return _condbreaknode(node)
+            if isinstance(node, ConditionalBreakNode):
+                return True, node
+            return False, None
 
-                    # pop the previously added node
-                    if new_nodes:
-                        new_nodes = new_nodes[:-1]
+        def _handle_SequenceNode(seq_node, parent=None, index=0, label=None):  # pylint:disable=unused-argument
+            i = 0
+            while i < len(seq_node.nodes):
+                node = seq_node.nodes[i]
+                r, cond_node = _condnode_truenode_only(node)
+                if r:
+                    r, cond_node_inner = _condnode_truenode_only(node.true_node)
+                    if r:
+                        # amazing!
+                        merged_cond = self._simplify_condition(claripy.And(cond_node.condition,
+                                                                           cond_node_inner.condition))
+                        new_node = ConditionNode(cond_node.addr,
+                                                 None,
+                                                 merged_cond,
+                                                 cond_node_inner.true_node,
+                                                 None
+                                                 )
+                        seq_node.nodes[i] = new_node
+                    else:
+                        r, condbreak_node = _condbreaknode(node.true_node)
+                        if r:
+                            # amazing!
+                            merged_cond = self._simplify_condition(claripy.And(cond_node.condition,
+                                                                               condbreak_node.condition))
+                            new_node = ConditionalBreakNode(condbreak_node.addr, merged_cond, condbreak_node.target)
+                            seq_node.nodes[i] = new_node
+                i += 1
 
-                    merged_condition = self._simplify_condition(claripy.Or(node.condition, prev_node.condition))
-                    new_node = ConditionalBreakNode(node.addr,
-                                                    merged_condition,
-                                                    node.target
-                                                    )
-                    node = new_node
+        handlers = {
+            SequenceNode: _handle_SequenceNode,
+        }
 
-            new_nodes.append(node)
-            i += 1
+        walker = SequenceWalker(handlers=handlers)
+        walker.walk(seq)
 
-        return SequenceNode(new_nodes)
+        return seq
+
 
     def _remove_claripy_bool_asts(self, node):
 
@@ -1469,12 +1439,12 @@ class Structurer(Analysis):
         elif type(node) is MultiNode:
             if node.nodes:
                 stmt = self._remove_last_statement(node.nodes[-1])
-                if SequenceNode.test_empty_node(node.nodes[-1]):
+                if BaseNode.test_empty_node(node.nodes[-1]):
                     node.nodes = node.nodes[:-1]
         elif type(node) is SequenceNode:
             if node.nodes:
                 stmt = self._remove_last_statement(node.nodes[-1])
-                if SequenceNode.test_empty_node(node.nodes[-1]):
+                if BaseNode.test_empty_node(node.nodes[-1]):
                     node.nodes = node.nodes[:-1]
         else:
             raise NotImplementedError()
@@ -1560,7 +1530,7 @@ class Structurer(Analysis):
         return targets
 
     @staticmethod
-    def _get_reaching_condition_subexprs(claripy_ast):
+    def _get_ast_subexprs(claripy_ast):
 
         queue = [ claripy_ast ]
         while queue:
@@ -1572,7 +1542,7 @@ class Structurer(Analysis):
                 # get the common subexpr of all operands
                 common = None
                 for arg in ast.args:
-                    subexprs = Structurer._get_reaching_condition_subexprs(arg)
+                    subexprs = Structurer._get_ast_subexprs(arg)
                     if common is None:
                         common = set(subexprs)
                     else:
@@ -1653,12 +1623,13 @@ class Structurer(Analysis):
             return cond.operand
         return ailment.Expr.UnaryOp(0, 'Not', cond)
 
-    def _simplify_condition(self, cond):
+    @staticmethod
+    def _simplify_condition(cond):
 
         claripy_simplified = claripy.simplify(cond)
         if not claripy_simplified.symbolic:
             return claripy_simplified
-        simplified = self._revert_short_circuit_conditions(cond)
+        simplified = Structurer._revert_short_circuit_conditions(cond)
         cond = simplified if simplified is not None else cond
         return cond
 
