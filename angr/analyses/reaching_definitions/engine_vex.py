@@ -1,15 +1,18 @@
+from typing import Optional, Iterable, Set, Union
 import logging
 
 import pyvex
 
+from ...engines.light import SimEngineLight, SimEngineLightVEXMixin, SpOffset, RegisterOffset
+from ...engines.vex.claripy.irop import operations as vex_operations
+from ...errors import SimEngineError
+from .definition import Definition
 from .atoms import Register, MemoryLocation, Parameter, Tmp
 from .constants import OP_BEFORE, OP_AFTER
 from .dataset import DataSet
 from .external_codeloc import ExternalCodeLocation
 from .undefined import Undefined, undefined
-from ...engines.light import SimEngineLight, SimEngineLightVEXMixin, SpOffset
-from angr.engines.vex.claripy.irop import operations as vex_operations
-from ...errors import SimEngineError
+from .live_definitions import LiveDefinitions
 
 l = logging.getLogger(name=__name__)
 
@@ -26,6 +29,8 @@ class SimEngineRDVEX(
         self._function_handler = function_handler
         self._visited_blocks = None
         self._dep_graph = None
+
+        self.state: LiveDefinitions
 
     def process(self, state, *args, **kwargs):
         self._dep_graph = kwargs.pop('dep_graph', None)
@@ -67,24 +72,33 @@ class SimEngineRDVEX(
         if self.state.analysis:
             self.state.analysis.insn_observe(self.ins_addr, stmt, self.block, self.state, OP_AFTER)
 
-    def _handle_WrTmp(self, stmt):
+    def _handle_WrTmp(self, stmt: pyvex.IRStmt.WrTmp):
         super()._handle_WrTmp(stmt)
-        self.state.kill_and_add_definition(Tmp(stmt.tmp), self._codeloc(), self.tmps[stmt.tmp])
+        self.state.kill_and_add_definition(Tmp(stmt.tmp, self.tyenv.sizeof(stmt.tmp) // 8),
+                                           self._codeloc(),
+                                           self.tmps[stmt.tmp])
 
-    def _handle_WrTmpData(self, tmp, data):
+    def _handle_WrTmpData(self, tmp: int, data):
         super()._handle_WrTmpData(tmp, data)
-        self.state.kill_and_add_definition(Tmp(tmp), self._codeloc(), self.tmps[tmp])
+        self.state.kill_and_add_definition(Tmp(tmp, self.tyenv.sizeof(tmp)),
+                                           self._codeloc(),
+                                           self.tmps[tmp])
 
     # e.g. PUT(rsp) = t2, t2 might include multiple values
     def _handle_Put(self, stmt):
-        reg_offset = stmt.offset
-        size = stmt.data.result_size(self.tyenv) // 8
+        reg_offset: int = stmt.offset
+        size: int = stmt.data.result_size(self.tyenv) // 8
         reg = Register(reg_offset, size)
         data = self._expr(stmt.data)
 
         if any(type(d) is Undefined for d in data):
             l.info('Data to write into register <%s> with offset %d undefined, ins_addr = %#x.',
                    self.arch.register_names[reg_offset], reg_offset, self.ins_addr)
+
+        # special handling for references to stack variables
+        for d in data:
+            if isinstance(d, SpOffset):
+                self.state.add_use(MemoryLocation(d, 1), self._codeloc())
 
         self.state.kill_and_add_definition(reg, self._codeloc(), data)
 
@@ -130,7 +144,7 @@ class SimEngineRDVEX(
                 self.state.kill_and_add_definition(memloc, self._codeloc(), data)
 
     def _handle_LoadG(self, stmt):
-        guard = self._expr(stmt.guard)
+        guard: DataSet = self._expr(stmt.guard)
         if guard.data == {True}:
             # FIXME: full conversion support
             if stmt.cvt.find('Ident') < 0:
@@ -165,38 +179,39 @@ class SimEngineRDVEX(
     # VEX expression handlers
     #
 
-    def _expr(self, expr):
+    def _expr(self, expr) -> DataSet:
         data = super()._expr(expr)
         if data is None:
             bits = expr.result_size(self.tyenv)
             data = DataSet(undefined, bits)
         return data
 
-    def _handle_RdTmp(self, expr):
-        tmp = expr.tmp
+    def _handle_RdTmp(self, expr: pyvex.IRExpr.RdTmp) -> Optional[DataSet]:
+        tmp: int = expr.tmp
 
-        self.state.add_use(Tmp(tmp), self._codeloc())
+        self.state.add_use(Tmp(tmp, expr.result_size(self.tyenv) // self.arch.byte_width), self._codeloc())
 
         if tmp in self.tmps:
             return self.tmps[tmp]
         return None
 
     # e.g. t0 = GET:I64(rsp), rsp might be defined multiple times
-    def _handle_Get(self, expr):
+    def _handle_Get(self, expr: pyvex.IRExpr.Get) -> Optional[DataSet]:
 
-        reg_offset = expr.offset
-        bits = expr.result_size(self.tyenv)
-        size = bits // self.arch.byte_width
+        reg_offset: int = expr.offset
+        bits: int = expr.result_size(self.tyenv)
+        size: int = bits // self.arch.byte_width
 
         # FIXME: size, overlapping
-        data = set()
-        current_defs = self.state.register_definitions.get_objects_by_offset(reg_offset)
+        data: Set[Union[Undefined,RegisterOffset,int]] = set()
+        current_defs: Iterable[Definition] = self.state.register_definitions.get_objects_by_offset(reg_offset)
         for current_def in current_defs:
             data.update(current_def.data)
         if len(data) == 0:
             # no defs can be found. add a fake definition
             data.add(undefined)
-            self.state.kill_and_add_definition(Register(reg_offset, size), self._external_codeloc(), DataSet(data, bits))
+            self.state.kill_and_add_definition(Register(reg_offset, size), self._external_codeloc(),
+                                               DataSet(data, bits))
         if any(type(d) is Undefined for d in data):
             l.info('Data in register <%s> with offset %d undefined, ins_addr = %#x.',
                    self.arch.register_names[reg_offset], reg_offset, self.ins_addr)
@@ -215,7 +230,8 @@ class SimEngineRDVEX(
         data = set()
         for a in addr:
             if isinstance(a, int):
-                current_defs = self.state.memory_definitions.get_objects_by_offset(a)
+                # Load data from a global region
+                current_defs: Iterable[Definition] = self.state.memory_definitions.get_objects_by_offset(a)
                 if current_defs:
                     for current_def in current_defs:
                         data.update(current_def.data)
@@ -228,7 +244,18 @@ class SimEngineRDVEX(
                         pass
 
                 # FIXME: _add_memory_use() iterates over the same loop
-                self.state.add_use(MemoryLocation(a, size), self._codeloc())
+                memory_location = MemoryLocation(a, size)
+                self.state.add_use(memory_location, self._codeloc())
+            elif isinstance(a, SpOffset):
+                # Load data from a local variable
+                current_defs: Iterable[Definition] = self.state.stack_definitions.get_objects_by_offset(a.offset)
+                if current_defs:
+                    for def_ in current_defs:
+                        data.update(def_.data)
+                else:
+                    data.add(undefined)
+                memory_location = MemoryLocation(a, size)
+                self.state.add_use(memory_location, self._codeloc())
             else:
                 l.info('Memory address undefined, ins_addr = %#x.', self.ins_addr)
 
@@ -433,6 +460,7 @@ class SimEngineRDVEX(
             handler_name = 'handle_unknown_call'
             if hasattr(self._function_handler, handler_name):
                 executed_rda, state = getattr(self._function_handler, handler_name)(self.state, self._codeloc())
+                state: LiveDefinitions
                 self.state = state
             else:
                 l.warning('Please implement the unknown function handler with your own logic.')
@@ -496,7 +524,7 @@ class SimEngineRDVEX(
                 raise ValueError('Invalid number of values for stack pointer.')
 
             sp_addr = next(iter(sp_data))
-            if isinstance(sp_addr, int):
+            if isinstance(sp_addr, (int, SpOffset)):
                 sp_addr -= self.arch.stack_change
             elif isinstance(sp_addr, Undefined):
                 pass
