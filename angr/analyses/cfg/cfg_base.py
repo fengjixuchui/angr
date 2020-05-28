@@ -1,4 +1,4 @@
-
+from typing import Dict
 import logging
 from collections import defaultdict
 
@@ -97,7 +97,7 @@ class CFGBase(Analysis):
 
         # IndirectJump object that describe all indirect exits found in the binary
         # stores as a map between addresses and IndirectJump objects
-        self.indirect_jumps = {}
+        self.indirect_jumps: Dict[int,IndirectJump] = {}
         self._indirect_jumps_to_resolve = set()
 
         # Indirect jump resolvers
@@ -323,10 +323,19 @@ class CFGBase(Analysis):
         raise NotImplementedError()
 
     def remove_edge(self, block_from, block_to):
-        edge = (block_from, block_to)
+        if self.graph is None:
+            raise TypeError("self.graph does not exist.")
 
-        if edge in self.graph:
-            self.graph.remove_edge(*edge)
+        if block_from not in self.graph:
+            raise ValueError("%r is not in CFG." % block_from)
+
+        if block_to not in self.graph:
+            raise ValueError("%r is not in CFG." % block_to)
+
+        if block_to not in self.graph[block_from]:
+            raise ValueError("Edge %r->%r does not exist." % (block_from, block_to))
+
+        self.graph.remove_edge(block_from, block_to)
 
     def _merge_cfgnodes(self, cfgnode_0, cfgnode_1):
         """
@@ -1142,6 +1151,16 @@ class CFGBase(Analysis):
             else:
                 # We gotta create a new one
                 l.error('normalize(): Please report it to Fish.')
+
+        # deal with duplicated entries in self.jump_tables and self.indirect_jumps
+        if smallest_node.addr in self.model.jump_tables:
+            for n in other_nodes:
+                if n.addr in self.model.jump_tables:
+                    del self.model.jump_tables[n.addr]
+        if smallest_node.addr in self.indirect_jumps:
+            for n in other_nodes:
+                if n.addr in self.indirect_jumps:
+                    del self.indirect_jumps[n.addr]
 
     #
     # Job management

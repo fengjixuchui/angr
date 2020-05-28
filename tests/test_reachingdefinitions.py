@@ -12,12 +12,14 @@ import nose
 import ailment
 import angr
 import archinfo
-from angr.analyses.reaching_definitions.atoms import GuardUse, Tmp, Register, MemoryLocation
-from angr.analyses.reaching_definitions.constants import OP_BEFORE, OP_AFTER
-from angr.analyses.reaching_definitions.live_definitions import (LiveDefinitions, Definition, SpOffset,
-                                                                 ExternalCodeLocation)
+from angr.knowledge_plugins.key_definitions.atoms import GuardUse, Tmp, Register, MemoryLocation
+from angr.knowledge_plugins.key_definitions.constants import OP_BEFORE, OP_AFTER
+from angr.knowledge_plugins.key_definitions.live_definitions import Definition, SpOffset
+from angr.analyses.reaching_definitions.external_codeloc import ExternalCodeLocation, CodeLocation
+from angr.analyses.reaching_definitions.rd_state import ReachingDefinitionsState
 from angr.analyses.reaching_definitions.subject import Subject, SubjectType
 from angr.analyses.reaching_definitions.dep_graph import DepGraph
+from angr.utils.constants import DEFAULT_STATEMENT
 from angr.block import Block
 
 LOGGER = logging.getLogger('test_reachingdefinitions')
@@ -62,7 +64,7 @@ class InsnAndNodeObserveTestingUtils():
             subject=main_function, observation_points=observation_points
         )
 
-        state = LiveDefinitions(
+        state = ReachingDefinitionsState(
            project.arch, reaching_definitions.subject,
         )
 
@@ -97,7 +99,6 @@ class ReachingDefinitionsAnalysisTest(TestCase):
             binary_results_name + '.pickle'
         )
 
-
     def test_reaching_definition_analysis_definitions(self):
         def _result_extractor(rda):
             unsorted_result = map(
@@ -124,7 +125,6 @@ class ReachingDefinitionsAnalysisTest(TestCase):
 
             self._run_reaching_definition_analysis_test(project, function, result_path, _result_extractor)
 
-
     def test_reaching_definition_analysis_visited_blocks(self):
         def _result_extractor(rda):
             return list(sorted(rda.visited_blocks, key=lambda b: b.addr))
@@ -141,7 +141,6 @@ class ReachingDefinitionsAnalysisTest(TestCase):
 
             self._run_reaching_definition_analysis_test(project, function, result_path, _result_extractor)
 
-
     def test_node_observe(self):
         # Create several different observation points
         observation_points = [('node', 0x42, OP_AFTER), ('insn', 0x43, OP_AFTER)]
@@ -155,10 +154,9 @@ class ReachingDefinitionsAnalysisTest(TestCase):
             reaching_definition.observed_results,
             observation_points
         )
-        expected_results = [state]
+        expected_results = [state.live_definitions]
 
         nose.tools.assert_equals(results, expected_results)
-
 
     def test_insn_observe_an_ailment_statement(self):
         # Create several different observation points
@@ -185,7 +183,6 @@ class ReachingDefinitionsAnalysisTest(TestCase):
             zip(results, expected_results)
         ))
 
-
     def test_insn_observe_before_an_imark_pyvex_statement(self):
         # Create several different observation points
         observation_points = [('node', 0x42, OP_AFTER), ('insn', 0x43, OP_BEFORE)]
@@ -210,7 +207,6 @@ class ReachingDefinitionsAnalysisTest(TestCase):
             lambda x: InsnAndNodeObserveTestingUtils.assert_equals_for_live_definitions(x[0], x[1]),
             zip(results, expected_results)
         ))
-
 
     def test_insn_observe_after_a_pyvex_statement(self):
         # Create several different observation points
@@ -238,7 +234,6 @@ class ReachingDefinitionsAnalysisTest(TestCase):
             lambda x: InsnAndNodeObserveTestingUtils.assert_equals_for_live_definitions(x[0], x[1]),
             zip(results, expected_results)
         ))
-
 
     def test_reaching_definition_analysis_exposes_its_subject(self):
         binary_path = os.path.join(TESTS_LOCATION, 'x86_64', 'all')
@@ -268,15 +263,14 @@ class LiveDefinitionsTest(TestCase):
         arch = archinfo.arch_ppc64.ArchPPC64()
         nose.tools.assert_raises(
            ValueError,
-           LiveDefinitions, arch=arch, subject=self._MockFunctionSubject()
+           ReachingDefinitionsState, arch=arch, subject=self._MockFunctionSubject()
         )
-
 
     def test_initializing_live_definitions_for_ppc_with_rtoc_value(self):
         arch = archinfo.arch_ppc64.ArchPPC64()
         rtoc_value = random.randint(0, 0xffffffffffffffff)
 
-        live_definition = LiveDefinitions(
+        live_definition = ReachingDefinitionsState(
            arch=arch, subject=self._MockFunctionSubject(), rtoc_value=rtoc_value
         )
 
@@ -287,7 +281,6 @@ class LiveDefinitionsTest(TestCase):
         rtoc_definition_value = rtoc_definition.data.get_first_element()
 
         nose.tools.assert_equals(rtoc_definition_value, rtoc_value)
-
 
     def test_get_the_sp_from_a_reaching_definition(self):
         binary = os.path.join(TESTS_LOCATION, 'x86_64', 'all')
@@ -365,9 +358,9 @@ def test_dep_graph_stack_variables():
     project = angr.Project(bin_path, auto_load_libs=False)
     arch = project.arch
     cfg = project.analyses.CFGFast()
-    main = cfg.functions['authenticate']
+    auth = cfg.functions['authenticate']
 
-    rda = project.analyses.ReachingDefinitions(subject=main, track_tmps=False, dep_graph=DepGraph())
+    rda = project.analyses.ReachingDefinitions(subject=auth, track_tmps=False, dep_graph=DepGraph())
     dep_graph = rda.dep_graph
     open_rdi = next(iter(filter(
         lambda def_: isinstance(def_.atom, Register) and def_.atom.reg_offset == arch.registers['rdi'][0]
@@ -399,6 +392,36 @@ def test_dep_graph_stack_variables():
     assert isinstance(rdi.atom, Register)
     assert rdi.atom.reg_offset == arch.registers['rdi'][0]
     assert isinstance(rdi.codeloc, ExternalCodeLocation)
+
+
+def test_uses_function_call_arguments():
+    bin_path = os.path.join(TESTS_LOCATION, 'x86_64', 'fauxware')
+    project = angr.Project(bin_path, auto_load_libs=False)
+    arch = project.arch
+    cfg = project.analyses.CFGFast()
+    main = cfg.functions['main']
+
+    project.analyses.CompleteCallingConventions(recover_variables=True)
+    rda = project.analyses.ReachingDefinitions(subject=main, track_tmps=False)
+
+    # 4007ae
+    # rsi and rdi are all used by authenticate()
+    uses = rda.all_uses.get_uses_by_location(CodeLocation(0x4007a0, DEFAULT_STATEMENT))
+    assert len(uses) == 2
+    auth_rdi = next(iter(filter(
+        lambda def_: isinstance(def_.atom, Register) and def_.atom.reg_offset == arch.registers['rdi'][0],
+        uses
+    )))
+    auth_rsi = next(iter(filter(
+        lambda def_: isinstance(def_.atom, Register) and def_.atom.reg_offset == arch.registers['rsi'][0],
+        uses
+    )))
+
+    # 4007AB mov     rdi, rax
+    assert auth_rdi.codeloc.ins_addr == 0x4007ab
+
+    # 4007A8 mov     rsi, rdx
+    assert auth_rsi.codeloc.ins_addr == 0x4007a8
 
 
 if __name__ == '__main__':

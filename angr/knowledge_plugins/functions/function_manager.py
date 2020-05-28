@@ -1,3 +1,4 @@
+from typing import Optional
 import logging
 import collections.abc
 from sortedcontainers import SortedDict
@@ -78,6 +79,8 @@ class FunctionManager(KnowledgeBasePlugin, collections.abc.Mapping):
     def copy(self):
         fm = FunctionManager(self._kb)
         fm._function_map = self._function_map.copy()
+        for address, function in fm._function_map.items():
+            fm._function_map[address] = function.copy()
         fm.callgraph = networkx.MultiDiGraph(self.callgraph)
         fm._arg_registers = self._arg_registers.copy()
 
@@ -240,7 +243,7 @@ class FunctionManager(KnowledgeBasePlugin, collections.abc.Mapping):
         except KeyError:
             return False
 
-    def __getitem__(self, k):
+    def __getitem__(self, k) -> Function:
         if isinstance(k, self.function_address_types):
             f = self.function(addr=k)
         elif type(k) is str:
@@ -331,7 +334,7 @@ class FunctionManager(KnowledgeBasePlugin, collections.abc.Mapping):
         except KeyError:
             return None
 
-    def function(self, addr=None, name=None, create=False, syscall=False, plt=None):
+    def function(self, addr=None, name=None, create=False, syscall=False, plt=None) -> Optional[Function]:
         """
         Get a function object from the function manager.
 

@@ -62,16 +62,17 @@ class RepHook:
             else:
                 raise NotImplementedError("Unsupported mnemonic %s" % self.mnemonic)
 
-            size = state.regs.ecx * multiplier
+            size = (state.regs.ecx if state.arch.name == "X86" else state.regs.rcx) * multiplier
 
             memset = SIM_PROCEDURES['libc']["memset"]
             memset().execute(state, arguments=[dst, val, size])
 
             if state.arch.name == "X86":
                 state.regs.edi += size
+                state.regs.ecx = 0
             else:
                 state.regs.rdi += size
-            state.regs.ecx = 0
+                state.regs.rcx = 0
 
         elif self.mnemonic.startswith("movs"):
 
@@ -89,7 +90,7 @@ class RepHook:
             else:
                 raise NotImplementedError("Unsupported mnemonic %s" % self.mnemonic)
 
-            size = state.regs.ecx * multiplier
+            size = (state.regs.ecx if state.arch.name == "X86" else state.regs.rcx) * multiplier
 
             memcpy = SIM_PROCEDURES['libc']["memcpy"]
             memcpy().execute(state, arguments=[dst, src, size])
@@ -97,10 +98,11 @@ class RepHook:
             if state.arch.name == "X86":
                 state.regs.edi += size
                 state.regs.esi -= size
+                state.regs.ecx = 0
             else:
                 state.regs.rdi += size
                 state.regs.rsi -= size
-            state.regs.ecx = 0
+                state.regs.rcx = 0
 
         else:
             import ipdb; ipdb.set_trace()
@@ -484,12 +486,14 @@ class Tracer(ExplorationTechnique):
         elif current_bin in self._aslr_slides:
             self._current_slide = self._aslr_slides[current_bin]
             return trace_addr == state_addr + self._current_slide
-        else:
-            if ((trace_addr - state_addr) & 0xfff) == 0:
+        elif ((trace_addr - state_addr) & 0xfff) == 0:
                 self._aslr_slides[current_bin] = self._current_slide = trace_addr - state_addr
                 return True
-            else:
-                raise AngrTracerError("Trace desynced on jumping into %s. Did you load the right version of this library?" % current_bin.provides)
+        # error handling
+        elif current_bin:
+            raise AngrTracerError("Trace desynced on jumping into %s. Did you load the right version of this library?" % current_bin.provides)
+        else:
+            raise AngrTracerError("Trace desynced on jumping into %#x, where no library is mapped!" % state_addr)
 
     def _analyze_misfollow(self, state, idx):
         angr_addr = state.addr

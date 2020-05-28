@@ -7,9 +7,10 @@ import ailment
 import pyvex
 import archinfo
 
+from ...engines.vex.claripy.irop import operations as vex_operations
+from ...code_location import CodeLocation
+from ...utils.constants import DEFAULT_STATEMENT
 from ..engine import SimEngine
-from angr.engines.vex.claripy.irop import operations as vex_operations
-from ...analyses.code_location import CodeLocation
 
 
 class SimEngineLight(SimEngine):
@@ -92,6 +93,7 @@ class SimEngineLightVEXMixin:
             self._handle_Stmt(stmt)
 
         if self.block.vex.jumpkind == 'Ijk_Call':
+            self.stmt_idx = DEFAULT_STATEMENT
             handler = '_handle_function'
             if hasattr(self, handler):
                 func_addr = self._expr(self.block.vex.next)
@@ -135,6 +137,9 @@ class SimEngineLightVEXMixin:
 
     def _handle_StoreG(self, stmt):
         raise NotImplementedError('Please implement the StoreG handler with your own logic.')
+
+    def _handle_LLSC(self, stmt: pyvex.IRStmt.LLSC):
+        raise NotImplementedError('Please implement the LLSC handler with your own logic.')
 
     #
     # Expression handlers
