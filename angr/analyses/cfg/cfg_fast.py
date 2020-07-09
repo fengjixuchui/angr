@@ -1055,7 +1055,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
         """
 
         if self._low_priority:
-            self._release_gil(len(self._nodes), 20, 0.0001)
+            self._release_gil(len(self._nodes), 20, 0.000001)
 
         # a new entry is picked. Deregister it
         self._deregister_analysis_job(job.func_addr, job)
@@ -2532,7 +2532,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
         jump.resolved_targets = targets
         all_targets = set(targets)
         for addr in all_targets:
-            to_outside = addr in self.functions or not self._addrs_belong_to_same_section(jump.addr, addr)
+            to_outside = jump.jumpkind == 'Ijk_Call' or addr in self.functions or not self._addrs_belong_to_same_section(jump.addr, addr)
 
             # TODO: get a better estimate of the function address
             target_func_addr = jump.func_addr if not to_outside else addr
@@ -3692,17 +3692,16 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                     break
             elif isinstance(stmt, pyvex.IRStmt.Put) and stmt.offset == self.project.arch.registers['gp'][0]:
                 last_gp_setting_insn_id = insn_ctr
-                break
 
         if last_gp_setting_insn_id is None:
             return None
 
         # Prudently search for $gp values
-        state = self.project.factory.blank_state(addr=addr, mode="fastpath",
+        state = self.project.factory.blank_state(addr=addr, mode="fastpath", remove_options=o.refs,
                                                  add_options={o.NO_CROSS_INSN_OPT},
                                                  )
-        state.regs.t9 = func_addr
-        state.regs.gp = 0xffffffff
+        state.regs._t9 = func_addr
+        state.regs._gp = 0xffffffff
         try:
             succ = self.project.factory.successors(state, num_inst=last_gp_setting_insn_id + 1)
         except SimIRSBNoDecodeError:
