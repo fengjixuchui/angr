@@ -362,16 +362,17 @@ class JumpTableProcessor(
             # We will need to initialize this register during slice execution later
 
             # Try to get where this register is first accessed
-            try:
-                source = next(iter(src for src in self.state._registers[addr.reg][0] if src != 'const'))
-                assert isinstance(source, tuple)
-                self.state.regs_to_initialize.append(source + (addr.reg, addr.bits))
-            except StopIteration:
-                # we don't need to initialize this register
-                # it might be caused by an incorrect analysis result
-                # e.g.  PN-337140.bin 11e918  r0 comes from r4, r4 comes from r0@11e8c0, and r0@11e8c0 comes from
-                # function call sub_375c04. Since we do not analyze sub_375c04, we treat r0@11e918 as a constant 0.
-                pass
+            if addr.reg in self.state._registers:
+                try:
+                    source = next(iter(src for src in self.state._registers[addr.reg][0] if src != 'const'))
+                    assert isinstance(source, tuple)
+                    self.state.regs_to_initialize.append(source + (addr.reg, addr.bits))
+                except StopIteration:
+                    # we don't need to initialize this register
+                    # it might be caused by an incorrect analysis result
+                    # e.g.  PN-337140.bin 11e918  r0 comes from r4, r4 comes from r0@11e8c0, and r0@11e8c0 comes from
+                    # function call sub_375c04. Since we do not analyze sub_375c04, we treat r0@11e918 as a constant 0.
+                    pass
 
             return None
 
@@ -385,8 +386,12 @@ class JumpTableProcessor(
 class StoreHook:
     @staticmethod
     def hook(state):
-        state.inspect.mem_write_expr = state.solver.BVS('instrumented_store',
-                                                        state.solver.eval(state.inspect.mem_write_length) * 8)
+        write_length = state.inspect.mem_write_length
+        if write_length is None:
+            write_length = len(state.inspect.mem_write_expr)
+        else:
+            write_length = write_length * state.arch.byte_width
+        state.inspect.mem_write_expr = state.solver.BVS('instrumented_store', write_length)
 
 
 class LoadHook:
@@ -420,6 +425,72 @@ class RegisterInitializerHook:
 
     def hook(self, state):
         state.registers.store(self.reg_offset, state.solver.BVV(self.value, self.reg_bits))
+
+
+class BSSHook:
+    def __init__(self, project, bss_regions):
+        self.project = project
+        self._bss_regions = bss_regions
+        self._written_addrs = set()
+
+    def bss_memory_read_hook(self, state):
+
+        if not self._bss_regions:
+            return
+
+        read_addr = state.inspect.mem_read_address
+        read_length = state.inspect.mem_read_length
+
+        if not isinstance(read_addr, int) and read_addr.symbolic:
+            # don't touch it
+            return
+
+        concrete_read_addr = state.solver.eval(read_addr)
+        concrete_read_length = state.solver.eval(read_length)
+
+        for start, size in self._bss_regions:
+            if start <= concrete_read_addr < start + size:
+                # this is a read from the .bss section
+                break
+        else:
+            return
+
+        if concrete_read_addr not in self._written_addrs:
+            # it was never written to before. we overwrite it with unconstrained bytes
+            for i in range(0, concrete_read_length, self.project.arch.bytes):
+                state.memory.store(concrete_read_addr + i, state.solver.Unconstrained('unconstrained',
+                                                                                      self.project.arch.bits))
+
+                # job done :-)
+
+    def bss_memory_write_hook(self, state):
+
+        if not self._bss_regions:
+            return
+
+        write_addr = state.inspect.mem_write_address
+
+        if not isinstance(write_addr, int) and write_addr.symbolic:
+            return
+
+        concrete_write_addr = state.solver.eval(write_addr)
+        concrete_write_length = state.solver.eval(state.inspect.mem_write_length) \
+            if state.inspect.mem_write_length is not None \
+            else len(state.inspect.mem_write_expr) // state.arch.byte_width
+
+        for start, size in self._bss_regions:
+            if start <= concrete_write_addr < start + size:
+                # hit a BSS section
+                break
+        else:
+            return
+
+        if concrete_write_length > 1024:
+            l.warning("Writing more 1024 bytes to the BSS region, only considering the first 1024 bytes.")
+            concrete_write_length = 1024
+
+        for i in range(concrete_write_addr, concrete_write_length):
+            self._written_addrs.add(i)
 
 #
 # Main class
@@ -532,10 +603,13 @@ class JumpTableResolver(IndirectJumpResolver):
         except NotAJumpTableNotification:
             return False, None
         if jump_target is not None:
-            ij = cfg.indirect_jumps[addr]
-            ij.jumptable = False
-            ij.resolved_targets = { jump_target }
-            return True, [ jump_target ]
+            if self._is_target_valid(cfg, jump_target):
+                ij = cfg.indirect_jumps[addr]
+                ij.jumptable = False
+                ij.resolved_targets = { jump_target }
+                return True, [ jump_target ]
+            else:
+                return False, None
 
         # Well, we have a real jump table to resolve!
 
@@ -575,7 +649,10 @@ class JumpTableResolver(IndirectJumpResolver):
 
             # any read from an uninitialized segment should be unconstrained
             if self._bss_regions:
-                bss_memory_read_bp = BP(when=BP_BEFORE, enabled=True, action=self._bss_memory_read_hook)
+                bss_hook = BSSHook(self.project, self._bss_regions)
+                bss_memory_write_bp = BP(when=BP_AFTER, enabled=True, action=bss_hook.bss_memory_write_hook)
+                start_state.inspect.add_breakpoint('mem_write', bss_memory_write_bp)
+                bss_memory_read_bp = BP(when=BP_BEFORE, enabled=True, action=bss_hook.bss_memory_read_hook)
                 start_state.inspect.add_breakpoint('mem_read', bss_memory_read_bp)
 
             # instrument specified store/put/load statements
@@ -1081,7 +1158,23 @@ class JumpTableResolver(IndirectJumpResolver):
 
         # sanity check and necessary pre-processing
         if stmts_adding_base_addr:
-            assert len(stmts_adding_base_addr) == 1  # Making sure we are only dealing with one operation here
+            if len(stmts_adding_base_addr) != 1:
+                # We do not support the cases where the base address involves more than one addition.
+                # One such case exists in libc-2.27.so shipped with Ubuntu x86 where esi is used as the address of the
+                # data region.
+                #
+                # .text:00047316 mov     eax, esi
+                # .text:00047318 mov     esi, [ebp+data_region_ptr]
+                # .text:0004731E movsx   eax, al
+                # .text:00047321 movzx   eax, byte ptr [esi+eax-603A0h]
+                # .text:00047329 mov     eax, ds:(jpt_47337 - 1D8000h)[esi+eax*4] ; switch 32 cases
+                # .text:00047330 lea     eax, (loc_47033 - 1D8000h)[esi+eax] ; jumptable 00047337 cases 0-13,27-31
+                # .text:00047337 jmp     eax             ; switch
+                #
+                # the proper solution requires angr to correctly determine that esi is the beginning address of the data
+                # region (in this case, 0x1d8000). we give up in such cases until we can reasonably perform a
+                # full-function data propagation before performing jump table recovery.
+                return None
             jump_base_addr = stmts_adding_base_addr[0]
             if jump_base_addr.base_addr_available:
                 addr_holders = {(jump_base_addr.stmt_loc[0], jump_base_addr.tmp)}
@@ -1200,7 +1293,7 @@ class JumpTableResolver(IndirectJumpResolver):
         for target in all_targets:
             # if the total number of targets is suspicious (it usually implies a failure in applying the
             # constraints), check if all jump targets are legal
-            if len(all_targets) in {0x100, 0x10000} and not self._is_jumptarget_legal(target):
+            if len(all_targets) in {1, 0x100, 0x10000} and not self._is_jumptarget_legal(target):
                 l.info("Jump target %#x is probably illegal. Try to resolve indirect jump at %#x from the next source.",
                        target, addr)
                 illegal_target_found = True
@@ -1318,36 +1411,6 @@ class JumpTableResolver(IndirectJumpResolver):
             if section.name == '.bss':
                 self._bss_regions.append((section.vaddr, section.memsize))
                 break
-
-    def _bss_memory_read_hook(self, state):
-
-        if not self._bss_regions:
-            return
-
-        read_addr = state.inspect.mem_read_address
-        read_length = state.inspect.mem_read_length
-
-        if not isinstance(read_addr, int) and read_addr.symbolic:
-            # don't touch it
-            return
-
-        concrete_read_addr = state.solver.eval(read_addr)
-        concrete_read_length = state.solver.eval(read_length)
-
-        for start, size in self._bss_regions:
-            if start <= concrete_read_addr < start + size:
-                # this is a read from the .bss section
-                break
-        else:
-            return
-
-        if not state.memory.was_written_to(concrete_read_addr):
-            # it was never written to before. we overwrite it with unconstrained bytes
-            for i in range(0, concrete_read_length, self.project.arch.bytes):
-                state.memory.store(concrete_read_addr + i, state.solver.Unconstrained('unconstrained',
-                                                                                      self.project.arch.bits))
-
-                # job done :-)
 
     def _init_registers_on_demand(self, state):
         # for uninitialized read using a register as the source address, we replace them in memory on demand

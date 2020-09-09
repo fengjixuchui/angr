@@ -2,6 +2,7 @@ import os
 import sys
 import copy
 import ctypes
+import cffi # lmao
 import threading
 import itertools
 import pkg_resources
@@ -17,6 +18,7 @@ from .plugin import SimStatePlugin
 from ..misc.testing import is_testing
 
 l = logging.getLogger(name=__name__)
+ffi = cffi.FFI()
 
 try:
     import unicorn
@@ -99,14 +101,18 @@ _unicounter = itertools.count()
 
 class Uniwrapper(unicorn.Uc if unicorn is not None else object):
     # pylint: disable=non-parent-init-called
-    def __init__(self, arch, cache_key):
+    def __init__(self, arch, cache_key, thumb=False):
         l.debug("Creating unicorn state!")
         self.arch = arch
         self.cache_key = cache_key
         self.wrapped_mapped = set()
         self.wrapped_hooks = set()
         self.id = None
-        unicorn.Uc.__init__(self, arch.uc_arch, arch.uc_mode)
+        if thumb:
+            uc_mode = arch.uc_mode_thumb
+        else:
+            uc_mode = arch.uc_mode
+        unicorn.Uc.__init__(self, arch.uc_arch, uc_mode)
 
     def hook_add(self, htype, callback, user_data=None, begin=1, end=0, arg1=0):
         h = unicorn.Uc.hook_add(self, htype, callback, user_data=user_data, begin=begin, end=end, arg1=arg1)
@@ -123,6 +129,11 @@ class Uniwrapper(unicorn.Uc if unicorn is not None else object):
     def mem_map(self, addr, size, perms=7):
         #l.debug("Mapping %d bytes at %#x", size, addr)
         m = unicorn.Uc.mem_map(self, addr, size, perms=perms)
+        self.wrapped_mapped.add((addr, size))
+        return m
+
+    def mem_map_ptr(self, addr, size, perms, ptr):
+        m = unicorn.Uc.mem_map_ptr(self, addr, size, perms, ptr)
         self.wrapped_mapped.add((addr, size))
         return m
 
@@ -217,7 +228,7 @@ def _load_native():
         _setup_prototype(h, 'destroy', None, ctypes.POINTER(MEM_PATCH))
         _setup_prototype(h, 'step', ctypes.c_uint64, state_t)
         _setup_prototype(h, 'stop_reason', stop_t, state_t)
-        _setup_prototype(h, 'activate', None, state_t, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_char_p)
+        _setup_prototype(h, 'activate_page', None, state_t, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_void_p)
         _setup_prototype(h, 'set_stops', None, state_t, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64))
         _setup_prototype(h, 'cache_page', ctypes.c_bool, state_t, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64)
         _setup_prototype(h, 'uncache_pages_touching_region', None, state_t, ctypes.c_uint64, ctypes.c_uint64)
@@ -234,6 +245,7 @@ def _load_native():
         _setup_prototype(h, 'set_tracking', None, state_t, ctypes.c_bool, ctypes.c_bool)
         _setup_prototype(h, 'executed_pages', ctypes.c_uint64, state_t)
         _setup_prototype(h, 'in_cache', ctypes.c_bool, state_t, ctypes.c_uint64)
+        _setup_prototype(h, 'set_map_callback', None, state_t, unicorn.unicorn.UC_HOOK_MEM_INVALID_CB)
 
         l.info('native plugin is enabled')
 
@@ -311,6 +323,7 @@ class Unicorn(SimStatePlugin):
         self.steps = 0
         self._mapped = 0
         self._uncache_regions = []
+        self._symbolic_offsets = None
         self.gdt = None
 
         # following variables are used in python level hook
@@ -353,6 +366,9 @@ class Unicorn(SimStatePlugin):
         self.transmit_addr = None
 
         self.time = None
+
+        self._bullshit_cb = ctypes.cast(unicorn.unicorn.UC_HOOK_MEM_INVALID_CB(self._hook_mem_unmapped), unicorn.unicorn.UC_HOOK_MEM_INVALID_CB)
+        self._skip_next_callback = False
 
     @SimStatePlugin.memo
     def copy(self, _memo):
@@ -422,18 +438,14 @@ class Unicorn(SimStatePlugin):
 
         # these are threshold for the number of times that we tolerate being kept out of unicorn
         # before we start concretizing
-        self.concretization_threshold_memory = min(
-            self.concretization_threshold_memory,
-            min(o.concretization_threshold_memory for o in others)
-        )
-        self.concretization_threshold_registers = min(
-            self.concretization_threshold_registers,
-            min(o.concretization_threshold_registers for o in others)
-        )
-        self.concretization_threshold_instruction = min(
-            self.concretization_threshold_instruction,
-            min(o.concretization_threshold_instruction for o in others)
-        )
+        def merge_nullable_min(*args):
+            nonnull = [a for a in args if a is not None]
+            if not nonnull:
+                return None
+            return min(nonnull)
+        self.concretization_threshold_memory = merge_nullable_min(self.concretization_threshold_memory, *(o.concretization_threshold_memory for o in others))
+        self.concretization_threshold_registers = merge_nullable_min(self.concretization_threshold_registers, *(o.concretization_threshold_registers for o in others))
+        self.concretization_threshold_instruction = merge_nullable_min(self.concretization_threshold_instruction, *(o.concretization_threshold_instruction for o in others))
 
         # these are sets of names of variables that should either always or never
         # be concretized
@@ -452,6 +464,7 @@ class Unicorn(SimStatePlugin):
 
     def __getstate__(self):
         d = dict(self.__dict__)
+        del d['_bullshit_cb']
         del d['_uc_state']
         del d['cache_key']
         del d['_unicount']
@@ -459,6 +472,7 @@ class Unicorn(SimStatePlugin):
 
     def __setstate__(self, s):
         self.__dict__.update(s)
+        self._bullshit_cb = ctypes.cast(unicorn.unicorn.UC_HOOK_MEM_INVALID_CB(self._hook_mem_unmapped), unicorn.unicorn.UC_HOOK_MEM_INVALID_CB)
         self._unicount = next(_unicounter)
         self._uc_state = None
         self.cache_key = hash(self)
@@ -476,17 +490,17 @@ class Unicorn(SimStatePlugin):
     @property
     def uc(self):
         new_id = next(_unicounter)
-
+        is_thumb = self.state.arch.qemu_name == 'arm' and self.state.arch.is_thumb(self.state.addr)
         if (
             not hasattr(_unicorn_tls, "uc") or
             _unicorn_tls.uc is None or
             _unicorn_tls.uc.arch != self.state.arch or
             _unicorn_tls.uc.cache_key != self.cache_key
         ):
-            _unicorn_tls.uc = Uniwrapper(self.state.arch, self.cache_key)
+            _unicorn_tls.uc = Uniwrapper(self.state.arch, self.cache_key, thumb=is_thumb)
         elif _unicorn_tls.uc.id != self._unicount:
             if not self._reuse_unicorn:
-                _unicorn_tls.uc = Uniwrapper(self.state.arch, self.cache_key)
+                _unicorn_tls.uc = Uniwrapper(self.state.arch, self.cache_key, thumb=is_thumb)
             else:
                 #l.debug("Reusing unicorn state!")
                 _unicorn_tls.uc.reset()
@@ -543,6 +557,12 @@ class Unicorn(SimStatePlugin):
             self.uc.hook_add(unicorn.UC_HOOK_INTR, self._hook_intr_mips, None, 1, 0)
         elif arch == 'mipsel':
             self.uc.hook_add(unicorn.UC_HOOK_INTR, self._hook_intr_mips, None, 1, 0)
+        elif arch == 'arm':
+            # EDG says: Unicorn's ARM support has no concept of interrupts.
+            # This is because interrupts are not a part of the ARM ISA per se, and interrupt controllers
+            # are left to the vendor to provide.
+            # TODO: This is not true for CortexM.  Revisit when Tobi's NVIC implementation gets upstreamed.
+            pass
         else:
             raise SimUnicornUnsupport
 
@@ -685,179 +705,96 @@ class Unicorn(SimStatePlugin):
             l.debug("... denied")
             return None
 
-    def _hook_mem_unmapped(self, uc, access, address, size, value, user_data, size_extension=True): #pylint:disable=unused-argument
+    def _hook_mem_unmapped(self, uc, access, address, size, value, user_data): #pylint:disable=unused-argument
         """
         This callback is called when unicorn needs to access data that's not yet present in memory.
         """
-        # FIXME check angr hooks at `address`
+        if user_data == 1:
+            self._skip_next_callback = True
+        elif self._skip_next_callback:
+            self._skip_next_callback = False
+            return True
 
-        if size_extension:
-            start = address & (0xfffffffffffff0000)
-            length = ((address + size + 0xffff) & (0xfffffffffffff0000)) - start
-        else:
-            start = address & (0xffffffffffffff000)
-            length = ((address + size + 0xfff) & (0xffffffffffffff000)) - start
+        start = address & ~0xfff
+        needed_pages = 2 if address - start + size > 0x1000 else 1
 
-        if (start == 0 or ((start + length) & ((1 << self.state.arch.bits) - 1)) == 0) and options.UNICORN_ZEROPAGE_GUARD in self.state.options:
-            # sometimes it happens because of %fs is not correctly set
-            self.error = 'accessing zero page [%#x, %#x] (%#x)' % (address, address + length - 1, access)
-            l.warning(self.error)
+        attempt_pages = 10
+        for pageno in range(attempt_pages):
+            page_addr = (start + pageno * 0x1000) & ((1 << self.state.arch.bits) - 1)
+            if page_addr == 0:
+                if pageno >= needed_pages:
+                    break
+                if options.UNICORN_ZEROPAGE_GUARD in self.state.options:
+                    self.error = 'accessing zero page (%#x)' % access
+                    l.warning(self.error)
 
-            # tell uc_state to rollback
-            _UC_NATIVE.stop(self._uc_state, STOP.STOP_ZEROPAGE)
-            return False
+                    _UC_NATIVE.stop(self._uc_state, STOP.STOP_ZEROPAGE)
+                    return False
 
-        ret = False
-        try:
-            best_effort_read = size_extension
-            ret = self._hook_mem_unmapped_core(uc, access, start, length, best_effort_read=best_effort_read)
-
-        except AccessingZeroPageError:
-            # raised when STRICT_PAGE_ACCESS is enabled
-            if not size_extension:
-                _UC_NATIVE.stop(self._uc_state, STOP.STOP_SEGFAULT)
-                ret = False
-
-        except FetchingZeroPageError:
-            # raised when trying to execute code on an unmapped page
-            if not size_extension:
-                self.error = 'fetching empty page [%#x, %#x]' % (start, start + length - 1)
-                l.warning(self.error)
-                _UC_NATIVE.stop(self._uc_state, STOP.STOP_EXECNONE)
-                ret = False
-
-        except SimMemoryError:
-            if not size_extension:
-                raise
-
-        except SegfaultError:
-            if not size_extension:
-                _UC_NATIVE.stop(self._uc_state, STOP.STOP_SEGFAULT)
-                ret = False
-
-        except MixedPermissonsError:
-            if not size_extension:
-                # weird... it shouldn't be raised at all
-                l.error('MixedPermissionsError is raised when size-extension is disabled. Please report it.')
-                _UC_NATIVE.stop(self._uc_state, STOP.STOP_SEGFAULT)
-                ret = False
-
-        except unicorn.UcError as ex:
-            if not size_extension:
-                if ex.errno == 11:
-                    # Mapping failed. Probably because of size extension... let's try to redo it without size extension
-                    pass
-                else:
-                    # just raise the exception
-                    raise
-
-        finally:
-            if size_extension and not ret:
-                # retry without size-extension if size-extension was enabled
-                # any exception will not be caught
-                ret = self._hook_mem_unmapped(uc, access, address, size, value, user_data, size_extension=False)
-
-        return ret
-
-    def _hook_mem_unmapped_core(self, uc, access, start, length, best_effort_read=True):
-
-        PAGE_SIZE = 4096
-
-        addr = start
-        end_addr = start + length
-        perms = set()
-        missing_pages = [ ]
-        while addr < end_addr:
-
+            l.info('mmap [%#x, %#x] because %d', page_addr, page_addr + 0xfff, access)
             try:
-                perm = self.state.memory.permissions(addr)
-                if perm.symbolic:
-                    perms.add(7)
-                elif options.ENABLE_NX not in self.state.options:
-                    perms.add(perm.args[0] | 4)
+                self._map_one_page(uc, page_addr)
+            except SegfaultError:
+                # this is the unicorn segfault error. idk why this would show up
+                _UC_NATIVE.stop(self._uc_state, STOP.STOP_SEGFAULT)
+                return False
+            except SimSegfaultError:
+                _UC_NATIVE.stop(self._uc_state, STOP.STOP_SEGFAULT)
+                return False
+            except unicorn.UcError as e:
+                if e.errno != 11:
+                    self.error = str(e)
+                    _UC_NATIVE.stop(self._uc_state, STOP.STOP_ERROR)
+                    return False
+                l.info("...already mapped :)")
+                break
+            except SimMemoryError as e:
+                if pageno >= needed_pages:
+                    l.info("...never mind")
+                    break
                 else:
-                    perms.add(perm.args[0])
-            except SimMemoryMissingError:
-                missing_pages.append(addr)
+                    self.error = str(e)
+                    _UC_NATIVE.stop(self._uc_state, STOP.STOP_ERROR)
+                    return False
 
-            addr += PAGE_SIZE
+        return True
 
-        if len(perms) == 0 and len(missing_pages) > 0:
-            # all pages are missing
-            if options.STRICT_PAGE_ACCESS in self.state.options:
-                raise AccessingZeroPageError()
-            elif access == unicorn.UC_MEM_FETCH_UNMAPPED:
-                raise FetchingZeroPageError()
-            else:
-                # initialize the memory page, but do not overwrite existing pages
-                self.state.memory.map_region(start, length, 3)
-                perm = 3
+    def _map_one_page(self, _uc, addr):
+        # allow any SimMemory errors to propagate upward. they will be caught immediately above
+        perm = self.state.memory.permissions(addr)
 
-        elif len(missing_pages) == 0 and len(perms) == 1:
-            # no page is missing, and all pages have the same permission
-            # great!
-            perm = list(perms)[0]
-
+        if perm.op != 'BVV':
+            perm = 7
+        elif options.ENABLE_NX not in self.state.options:
+            perm = perm.args[0] | 4
         else:
-            # either pages have different permissions, or only some of the pages are missing
-            # give up
-            raise MixedPermissonsError()
+            perm = perm.args[0]
 
-        try:
-            ret_on_segv = True if best_effort_read else False
-            items = self.state.memory.mem.load_objects(start, length, ret_on_segv=ret_on_segv)
-        except SimSegfaultError:
-            raise SegfaultError
+        # this should return two memoryviews
+        # if they are writable they are direct references to the state backing store and can be mapped directly
+        data, bitmap = self.state.memory.concrete_load(addr, 0x1000, with_bitmap=True, writing=(perm & 2) != 0)
 
-        if access == unicorn.UC_MEM_FETCH_UNMAPPED and len(items) == 0:
-            # we can not initialize an empty page then execute on it
-            raise FetchingZeroPageError()
+        if not bitmap:
+            raise SimMemoryError('No bytes available in memory? when would this happen...')
 
-        data = bytearray(length)
-        taint = [ ] # this is a list to reference a nonlocal variable. we're using the list like an Option<c array>
+        if bitmap.readonly:
+            # old-style mapping, do it via copy
+            self.uc.mem_map(addr, 0x1000, perm)
+            # huge hack. why doesn't ctypes let you pass memoryview as void*?
+            unicorn.unicorn._uc.uc_mem_write(self.uc._uch, addr, ctypes.cast(int(ffi.cast('uint64_t', ffi.from_buffer(data))), ctypes.c_void_p), len(data))
+            #self.uc.mem_write(addr, data)
+            self._mapped += 1
+            _UC_NATIVE.activate_page(self._uc_state, addr, int(ffi.cast('uint64_t', ffi.from_buffer(bitmap))), None)
+        else:
+            # new-style mapping, do it directly
+            self.uc.mem_map_ptr(addr, 0x1000, perm, int(ffi.cast('uint64_t', ffi.from_buffer(data))))
+            self._mapped += 1
+            _UC_NATIVE.activate_page(self._uc_state, addr, int(ffi.cast('uint64_t', ffi.from_buffer(bitmap))), int(ffi.cast('unsigned long', ffi.from_buffer(data))))
 
-        def _taint(pos, chunk_size):
-            if not taint:
-                taint.append(ctypes.create_string_buffer(int(length)))
-            offset = ctypes.cast(ctypes.addressof(taint[0]) + pos - start, ctypes.POINTER(ctypes.c_char))
-            ctypes.memset(offset, 0x2, chunk_size) # mark them as TAINT_SYMBOLIC
+        return
 
-        def _missing(pos, chunk_size, data=data):
-            if options.CGC_ZERO_FILL_UNCONSTRAINED_MEMORY not in self.state.options:
-                _taint(pos, chunk_size)
-            else:
-                data[pos-start:pos-start+chunk_size] = b"\0"*chunk_size
-
-        # fill out the data in reverse
-        last_missing = start + length - 1
-        for mo_addr,mo in reversed(items):
-            if not mo.includes(last_missing):
-                #print "MISSING: %x, %d" % (mo.last_addr+1, last_missing-mo.last_addr)
-                _missing(mo.last_addr+1, last_missing-mo.last_addr)
-                last_missing = mo.last_addr
-
-            # investigate the chunk, taint if symbolic
-            chunk_size = last_missing - mo_addr + 1
-            chunk = mo.bytes_at(mo_addr, chunk_size, allow_concrete=True)
-            if mo.is_bytes:
-                data[mo_addr - start : mo_addr - start + chunk_size] = chunk
-            else:
-                d = self._process_value(chunk, 'mem')
-                if d is None:
-                    #print "TAINT: %x, %d" % (mo_addr, chunk_size)
-                    _taint(mo_addr, chunk_size)
-                else:
-                    s = self.state.solver.eval(d, cast_to=bytes)
-                    data[mo_addr-start:mo_addr-start+chunk_size] = s
-            last_missing = mo_addr - 1
-
-        # handle missing bytes at the beginning
-        if last_missing != start - 1:
-            #print "MISSING START: %x, %d" % (start, last_missing - start + 1)
-            _missing(start, last_missing - start + 1)
 
         # do the mapping
-        l.info('mmap [%#x, %#x], %d%s (because %d)', start, start + length - 1, perm, ' (symbolic)' if taint else '', access)
         if not taint and not perm & 2:
             # page is non-writable, handle it with native code
             l.debug('caching non-writable page')
@@ -907,29 +844,8 @@ class Unicorn(SimStatePlugin):
         # tricky: using unicorn handle from unicorn.Uc object
         self._uc_state = _UC_NATIVE.alloc(self.uc._uch, self.cache_key)
 
-        # set (cgc, for now) transmit syscall handler
-        if UNICORN_HANDLE_TRANSMIT_SYSCALL in self.state.options and self.state.has_plugin('cgc'):
-            if self.transmit_addr is None:
-                l.error("You haven't set the address for concrete transmits!!!!!!!!!!!")
-                self.transmit_addr = 0
-            _UC_NATIVE.set_transmit_sysno(self._uc_state, 2, self.transmit_addr)
-
-        # activate gdt page, which was written/mapped during set_regs
-        if self.gdt is not None:
-            _UC_NATIVE.activate(self._uc_state, self.gdt.addr, self.gdt.limit, None)
-
-    def start(self, step=None):
-        self.jumpkind = 'Ijk_Boring'
-        self.countdown_nonunicorn_blocks = self.cooldown_nonunicorn_blocks
-
-        for addr, length in self._uncache_regions:
-            l.debug("Un-caching writable page region @ %#x of length %x", addr, length)
-            _UC_NATIVE.uncache_pages_touching_region(self._uc_state, addr, length)
-        self._uncache_regions = []
-
-        # should this be in setup?
         if options.UNICORN_SYM_REGS_SUPPORT in self.state.options and \
-           options.UNICORN_AGGRESSIVE_CONCRETIZATION not in self.state.options:
+                options.UNICORN_AGGRESSIVE_CONCRETIZATION not in self.state.options:
             archinfo = copy.deepcopy(self.state.arch.vex_archinfo)
             archinfo['hwcache_info']['caches'] = 0
             archinfo['hwcache_info'] = _VexCacheInfo(**archinfo['hwcache_info'])
@@ -939,34 +855,35 @@ class Unicorn(SimStatePlugin):
                 _VexArchInfo(**archinfo),
             )
 
-            # TODO: refactor
-            # first, check to see if *any* registers are symbolic, so that we
-            # can optimize the case where there aren't any. (N.B.: "optimize"
-            # does not refer to constructing the set of symbolic register
-            # offsets, but rather to not having to lift each block etc.)
-            if not self._check_registers(report=False):
-                highest_reg_offset, reg_size = max(self.state.arch.registers.values())
-                symbolic_offsets = set(range(0, highest_reg_offset+reg_size))
-                items = self.state.registers.mem.load_objects(0, highest_reg_offset+reg_size)
-                for start,v in items:
-                    end = v.last_addr + 1
-                    vv = self._symbolic_passthrough(v.object)
-
-                    if not vv.symbolic:
-                        symbolic_offsets.difference_update(range(start, end))
-                    else:
-                        symbolic_offsets.difference_update(b for b,vb in enumerate(vv.chop(8), start) if not vb.symbolic)
-
-                # for register flagged systems, we should save off all CC regs together
-                if self.state.arch.name == 'X86' and symbolic_offsets & set(range(40, 56)):
-                    symbolic_offsets.update(range(40, 56))
-                elif self.state.arch.name == 'AMD64' and symbolic_offsets & set(range(144, 176)):
-                    symbolic_offsets.update(range(144, 176))
-
-                sym_regs_array = (ctypes.c_uint64 * len(symbolic_offsets))(*map(ctypes.c_uint64, symbolic_offsets))
-                _UC_NATIVE.symbolic_register_data(self._uc_state, len(symbolic_offsets), sym_regs_array)
+            if self._symbolic_offsets:
+                l.debug("Sybmolic offsets: %s", self._symbolic_offsets)
+                sym_regs_array = (ctypes.c_uint64 * len(self._symbolic_offsets))(*map(ctypes.c_uint64, self._symbolic_offsets))
+                _UC_NATIVE.symbolic_register_data(self._uc_state, len(self._symbolic_offsets), sym_regs_array)
             else:
                 _UC_NATIVE.symbolic_register_data(self._uc_state, 0, None)
+
+        # set (cgc, for now) transmit syscall handler
+        if UNICORN_HANDLE_TRANSMIT_SYSCALL in self.state.options and self.state.has_plugin('cgc'):
+            if self.transmit_addr is None:
+                l.error("You haven't set the address for concrete transmits!!!!!!!!!!!")
+                self.transmit_addr = 0
+            _UC_NATIVE.set_transmit_sysno(self._uc_state, 2, self.transmit_addr)
+
+        # set memory map callback so we can call it explicitly
+        _UC_NATIVE.set_map_callback(self._uc_state, self._bullshit_cb)
+
+        # activate gdt page, which was written/mapped during set_regs
+        if self.gdt is not None:
+            _UC_NATIVE.activate_page(self._uc_state, self.gdt.addr, bytes(0x1000), None)
+
+    def start(self, step=None):
+        self.jumpkind = 'Ijk_Boring'
+        self.countdown_nonunicorn_blocks = self.cooldown_nonunicorn_blocks
+
+        for addr, length in self._uncache_regions:
+            l.debug("Un-caching writable page region @ %#x of length %x", addr, length)
+            _UC_NATIVE.uncache_pages_touching_region(self._uc_state, addr, length)
+        self._uncache_regions = []
 
         addr = self.state.solver.eval(self.state.ip)
         l.info('started emulation at %#x (%d steps)', addr, self.max_steps if step is None else step)
@@ -1001,7 +918,7 @@ class Unicorn(SimStatePlugin):
         # should this be in destroy?
         _UC_NATIVE.disable_symbolic_reg_tracking(self._uc_state)
 
-        # syncronize memory contents - head is a linked list of memory updates
+        # synchronize memory contents - head is a linked list of memory updates
         head = _UC_NATIVE.sync(self._uc_state)
         p_update = head
         while bool(p_update):
@@ -1112,6 +1029,8 @@ class Unicorn(SimStatePlugin):
         ''' setting unicorn registers '''
         uc = self.uc
 
+        self._symbolic_offsets = set()
+
         if self.state.arch.qemu_name == 'x86_64':
             fs = self.state.solver.eval(self.state.regs.fs)
             gs = self.state.solver.eval(self.state.regs.gs)
@@ -1120,17 +1039,34 @@ class Unicorn(SimStatePlugin):
             flags = self._process_value(self.state.regs.eflags, 'reg')
             if flags is None:
                 raise SimValueError('symbolic eflags')
+            elif flags.symbolic:
+                vex_offset = self.state.arch.registers['cc_op'][0]
+                self._symbolic_offsets.update(range(vex_offset, vex_offset + 8*4))
             uc.reg_write(self._uc_const.UC_X86_REG_EFLAGS, self.state.solver.eval(flags))
+
         elif self.state.arch.qemu_name == 'i386':
             flags = self._process_value(self.state.regs.eflags, 'reg')
             if flags is None:
                 raise SimValueError('symbolic eflags')
+            elif flags.symbolic:
+                vex_offset = self.state.arch.registers['cc_op'][0]
+                self._symbolic_offsets.update(range(vex_offset, vex_offset + 4*4))
 
             uc.reg_write(self._uc_const.UC_X86_REG_EFLAGS, self.state.solver.eval(flags))
+
             fs = self.state.solver.eval(self.state.regs.fs) << 16
             gs = self.state.solver.eval(self.state.regs.gs) << 16
             self.setup_gdt(fs, gs)
 
+        # handle ARM's "cpsr" register, equivalent of x86's eflags
+        elif self.state.arch.qemu_name == 'arm':
+            flags = self._process_value(self.state.regs.flags, 'reg')
+            if flags is None:
+                raise SimValueError('symbolic cpsr')
+            elif flags.symbolic:
+                vex_offset = self.state.arch.registers['cc_op'][0]
+                self._symbolic_offsets.update(range(vex_offset, vex_offset + 4*4))
+            uc.reg_write(self._uc_const.UC_ARM_REG_CPSR, self.state.solver.eval(flags))
 
         for r, c in self._uc_regs.items():
             if r in self.reg_blacklist:
@@ -1141,6 +1077,12 @@ class Unicorn(SimStatePlugin):
             # l.debug('setting $%s = %#x', r, self.state.solver.eval(v))
             uc.reg_write(c, self.state.solver.eval(v))
 
+            start, size = self.state.arch.registers[r]
+            if v.symbolic:
+                self._symbolic_offsets.update(b for b,vb in enumerate(reversed(v.chop(8)), start) if vb.symbolic)
+
+        # TODO: Support ARM hardfloat synchronization
+
         if self.state.arch.name in ('X86', 'AMD64'):
             # sync the fp clerical data
             c3210 = self.state.solver.eval(self.state.regs.fc3210)
@@ -1150,6 +1092,10 @@ class Unicorn(SimStatePlugin):
             status = (top << 11) | c3210
             uc.reg_write(unicorn.x86_const.UC_X86_REG_FPCW, control)
             uc.reg_write(unicorn.x86_const.UC_X86_REG_FPSW, status)
+
+            for rn in ('fc3210', 'ftop', 'fpround'):
+                start, size = self.state.arch.registers[rn]
+                self._symbolic_offsets.difference_update(range(start, start + size))
 
             # we gotta convert the 64-bit doubles values to 80-bit extended precision!
             uc_offset = unicorn.x86_const.UC_X86_REG_FP0
@@ -1165,6 +1111,8 @@ class Unicorn(SimStatePlugin):
                     val = self._process_value(self.state.registers.load(vex_offset, size=8), 'reg')
                     if val is None:
                         raise SimValueError('setting a symbolic fp register')
+                    if val.symbolic:
+                        self._symbolic_offsets.difference_update(b for b,vb in enumerate(val.chop(8), start) if vb.symbolic)
                     val = self.state.solver.eval(val)
 
                     sign = bool(val & 0x8000000000000000)
@@ -1262,12 +1210,14 @@ class Unicorn(SimStatePlugin):
                 if cur_group is None:
                     cur_group = i
                 elif i != last + 1 or cur_group//self.state.arch.bytes != i//self.state.arch.bytes:
+                    l.debug("Restoring symbolic register %d", cur_group)
                     saved_registers.append((
                         cur_group, self.state.registers.load(cur_group, last-cur_group+1)
                     ))
                     cur_group = i
                 last = i
             if cur_group is not None:
+                l.debug("Restoring symbolic register %d", cur_group)
                 saved_registers.append((
                     cur_group, self.state.registers.load(cur_group, last-cur_group+1)
                 ))
@@ -1339,6 +1289,8 @@ class Unicorn(SimStatePlugin):
                 vex_offset += 8
                 tag_word >>= 2
                 vex_tag_offset -= 1
+
+        # TODO: ARM hardfloat
 
         # now, we restore the symbolic registers
         if options.UNICORN_SYM_REGS_SUPPORT in self.state.options:
