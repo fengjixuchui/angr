@@ -1,6 +1,7 @@
-class Undefined:
+class UnknownSize:
     """
-    A TOP-like value indicating an unknown data source. Should live next to raw integers in DataSets.
+    A value indicating an unknown size for elements of DataSets.
+    Should "behave" like an integer.
     """
     def __add__(self, other):
         return self
@@ -48,18 +49,30 @@ class Undefined:
         return self
 
     def __eq__(self, other):
-        return type(other) is Undefined
+        return type(other) is UnknownSize
 
     def __ne__(self, other):
         return not (self == other)
 
+    def __le__(self, other):
+        return False
+
+    def __lt__(self, other):
+        return False
+
+    def __ge__(self, other):
+        return True
+
+    def __gt__(self, other):
+        return True
+
     def __hash__(self):
-        return hash('undefined')
+        return hash('unknown size')
 
     def __str__(self):
-        return '<Undefined>'
+        return '<UnknownSize>'
 
     def __repr__(self):
-        return "<Undefined>"
+        return "<UnknownSize>"
 
-UNDEFINED = Undefined()
+UNKNOWN_SIZE = UnknownSize()

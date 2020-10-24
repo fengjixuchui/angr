@@ -569,11 +569,11 @@ class Unicorn(SimStatePlugin):
     def _hook_intr_mips(self, uc, intno, user_data):
         self.trap_ip = self.uc.reg_read(unicorn.mips_const.UC_MIPS_REG_PC)
 
-        if intno == 17: # EXCP_SYSCALL
+        if intno == 17:  # EXCP_SYSCALL
             sysno = uc.reg_read(self._uc_regs['v0'])
             pc = uc.reg_read(self._uc_regs['pc'])
             l.debug('hit sys_%d at %#x', sysno, pc)
-            self._syscall_pc = pc + 4  # skip syscall instruction
+            self._syscall_pc = pc
             self._handle_syscall(uc, user_data)
         else:
             l.warning('unhandled interrupt %d', intno)
@@ -1067,6 +1067,11 @@ class Unicorn(SimStatePlugin):
                 vex_offset = self.state.arch.registers['cc_op'][0]
                 self._symbolic_offsets.update(range(vex_offset, vex_offset + 4*4))
             uc.reg_write(self._uc_const.UC_ARM_REG_CPSR, self.state.solver.eval(flags))
+
+        elif self.state.arch.qemu_name == 'mips':
+            # ulr
+            ulr = self.state.regs._ulr
+            uc.reg_write(self._uc_const.UC_MIPS_REG_CP0_USERLOCAL, self.state.solver.eval(ulr))
 
         for r, c in self._uc_regs.items():
             if r in self.reg_blacklist:

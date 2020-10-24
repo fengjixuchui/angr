@@ -68,8 +68,9 @@ def _build_native():
             pass
 
     cmd1 = ['nmake', '/f', 'Makefile-win']
-    cmd2 = ['make']
-    for cmd in (cmd1, cmd2):
+    cmd2 = ['gmake']
+    cmd3 = ['make']
+    for cmd in (cmd1, cmd2, cmd3):
         try:
             if subprocess.call(cmd, cwd='native', env=env) != 0:
                 raise LibError('Unable to build angr_native')
@@ -129,11 +130,11 @@ if 'bdist_wheel' in sys.argv and '--plat-name' not in sys.argv:
         # https://www.python.org/dev/peps/pep-0425/
         sys.argv.append(name.replace('.', '_').replace('-', '_'))
 
-_UNICORN = "unicorn>=1.0.2rc4"
+_UNICORN = "unicorn==1.0.2rc4"
 
 setup(
     name='angr',
-    version='8.20.7.27',
+    version='9.0.gitrolling',
     python_requires='>=3.6',
     description='A multi-architecture binary analysis toolkit, with the ability to perform dynamic symbolic execution and various static analyses on binaries',
     url='https://github.com/angr/angr',
@@ -149,11 +150,11 @@ setup(
         'rpyc',
         'cffi>=1.14.0',
         _UNICORN,
-        'archinfo==8.20.7.27',
-        'claripy==8.20.7.27',
-        'cle==8.20.7.27',
-        'pyvex==8.20.7.27',
-        'ailment==8.20.7.27',
+        'archinfo==9.0.gitrolling',
+        'claripy==9.0.gitrolling',
+        'cle==9.0.gitrolling',
+        'pyvex==9.0.gitrolling',
+        'ailment==9.0.gitrolling',
         'GitPython',
         'psutil',
         'pycparser>=2.18',
